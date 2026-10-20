@@ -82,6 +82,45 @@ fn parse_key(value: &str, field: &'static str) -> Result<[u8; 32], TunnelError> 
         })
 }
 
+/// What the tunnel wants done after an operation.
+///
+/// boringtun can produce datagrams to send to the peer and decrypted inner IP
+/// packets from a single call; keeping the two streams separate means the
+/// caller never has to guess which is which.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TunnelOutput {
+    /// Encrypted WireGuard datagrams to send to the peer (handshake, keepalive,
+    /// data).
+    pub to_network: Vec<Vec<u8>>,
+    /// Decrypted inner IP packets to hand to the gateway.
+    pub to_tunnel: Vec<Vec<u8>>,
+    /// How long until `tick` should be called again, if the tunnel needs it.
+    ///
+    /// Always `None` for now: boringtun 0.7.1 exposes no "next timer deadline"
+    /// signal (its timer constants are private and `update_timers` only returns
+    /// a `TunnResult`), so the caller must drive `tick` on its own schedule.
+    pub retry_after: Option<Duration>,
+}
+
+/// Fold a boringtun result into `out`.
+///
+/// Returns `true` when the caller should keep flushing with an empty datagram
+/// (a `WriteToNetwork` was produced), `false` when the operation is finished.
+fn absorb(out: &mut TunnelOutput, result: TunnResult<'_>) -> Result<bool, TunnelError> {
+    match result {
+        TunnResult::WriteToNetwork(pkt) => {
+            out.to_network.push(pkt.to_vec());
+            Ok(true)
+        }
+        TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
+            out.to_tunnel.push(pkt.to_vec());
+            Ok(false)
+        }
+        TunnResult::Done => Ok(false),
+        TunnResult::Err(err) => Err(err.into()),
+    }
+}
+
 /// A point-to-point WireGuard tunnel.
 pub struct Tunnel {
     tunn: Tunn,
@@ -116,71 +155,45 @@ impl Tunnel {
 
     /// Encrypt a plaintext IP packet.
     ///
-    /// Returns the WireGuard datagram(s) to put on the wire. When no session is
-    /// established yet, boringtun queues the packet and emits a handshake
-    /// initiation instead; the queued packet is delivered once the session
-    /// comes up.
-    pub fn encapsulate(&mut self, ip: &[u8]) -> Result<Vec<Vec<u8>>, TunnelError> {
-        let mut out = vec![0u8; ip.len().max(MIN_PACKET_BUFFER) + 32];
-        let mut packets = Vec::new();
-        match self.tunn.encapsulate(ip, &mut out) {
-            TunnResult::WriteToNetwork(pkt) => packets.push(pkt.to_vec()),
-            TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
-                packets.push(pkt.to_vec());
-            }
-            TunnResult::Done => {}
-            TunnResult::Err(err) => return Err(err.into()),
-        }
-        Ok(packets)
+    /// Returns the WireGuard datagram(s) to put on the wire in
+    /// [`TunnelOutput::to_network`]. When no session is established yet,
+    /// boringtun queues the packet and emits a handshake initiation instead;
+    /// the queued packet is delivered once the session comes up.
+    pub fn encapsulate(&mut self, ip_packet: &[u8]) -> Result<TunnelOutput, TunnelError> {
+        let mut buf = vec![0u8; ip_packet.len().max(MIN_PACKET_BUFFER) + 32];
+        let mut output = TunnelOutput::default();
+        absorb(&mut output, self.tunn.encapsulate(ip_packet, &mut buf))?;
+        Ok(output)
     }
 
     /// Process an incoming UDP datagram from the peer.
     ///
-    /// Returns the resulting packets. Decrypted IP packets
-    /// ([`TunnResult::WriteToTunnelV4`]/`V6`) and WireGuard datagrams that must
-    /// be sent back to the peer ([`TunnResult::WriteToNetwork`], e.g. handshake
-    /// responses and keepalives) are both returned; the caller tells them apart
-    /// by IP version (WireGuard messages start with a type byte in `1..=4`).
-    pub fn handle_udp(&mut self, dg: &[u8]) -> Result<Vec<Vec<u8>>, TunnelError> {
-        let mut packets = Vec::new();
-        let mut datagram = dg;
+    /// WireGuard datagrams that must be sent back (handshake responses,
+    /// keepalives) land in [`TunnelOutput::to_network`]; decrypted inner IP
+    /// packets land in [`TunnelOutput::to_tunnel`]. Nothing is dropped.
+    pub fn handle_udp(&mut self, datagram: &[u8]) -> Result<TunnelOutput, TunnelError> {
+        let mut output = TunnelOutput::default();
+        let mut current = datagram;
         loop {
-            let mut out = vec![0u8; MAX_DATAGRAM];
-            match self.tunn.decapsulate(None, datagram, &mut out) {
-                TunnResult::Done => break,
-                TunnResult::Err(err) => return Err(err.into()),
-                TunnResult::WriteToNetwork(pkt) => {
-                    packets.push(pkt.to_vec());
-                    // Per boringtun: after a WriteToNetwork, keep calling with an
-                    // empty datagram to flush any queued packets until Done.
-                    datagram = &[];
-                }
-                TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
-                    packets.push(pkt.to_vec());
-                    break;
-                }
+            let mut buf = vec![0u8; MAX_DATAGRAM];
+            // Per boringtun: after a WriteToNetwork, keep calling with an empty
+            // datagram to flush any queued packets until Done.
+            if !absorb(&mut output, self.tunn.decapsulate(None, current, &mut buf))? {
+                break;
             }
+            current = &[];
         }
-        Ok(packets)
+        Ok(output)
     }
 
     /// Advance the tunnel timers (handshake retries, keepalives, session expiry).
     ///
-    /// Returns any datagrams to put on the wire plus the age of the current
-    /// session (`None` while no session is live), which the caller can use to
-    /// drive the next tick.
-    pub fn tick(&mut self) -> Result<(Vec<Vec<u8>>, Option<Duration>), TunnelError> {
-        let mut out = vec![0u8; MAX_DATAGRAM];
-        let mut packets = Vec::new();
-        match self.tunn.update_timers(&mut out) {
-            TunnResult::Done => {}
-            TunnResult::Err(err) => return Err(err.into()),
-            TunnResult::WriteToNetwork(pkt) => packets.push(pkt.to_vec()),
-            TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
-                packets.push(pkt.to_vec());
-            }
-        }
-        Ok((packets, self.tunn.time_since_last_handshake()))
+    /// Any resulting datagrams land in [`TunnelOutput::to_network`].
+    pub fn tick(&mut self) -> Result<TunnelOutput, TunnelError> {
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let mut output = TunnelOutput::default();
+        absorb(&mut output, self.tunn.update_timers(&mut buf))?;
+        Ok(output)
     }
 }
 
@@ -215,13 +228,6 @@ mod tests {
         ip
     }
 
-    /// True when `pkt` is a WireGuard transport/handshake message rather than a
-    /// decrypted IP packet. WireGuard messages start with a little-endian type
-    /// in `1..=4`; IP packets start with a version nibble of `4` or `6`.
-    fn is_wireguard_datagram(pkt: &[u8]) -> bool {
-        matches!(pkt.first(), Some(1..=4))
-    }
-
     #[test]
     fn handshake_and_roundtrip() {
         let phone_secret = [0x11; 32];
@@ -233,31 +239,24 @@ mod tests {
         let ip = ipv4_packet();
 
         // Drive the handshake: the phone initiates by encapsulating a packet
-        // (boringtun queues it and emits a handshake initiation). Datagrams are
-        // then bounced between the two sides until both report a live session.
-        let mut to_router = phone.encapsulate(&ip).unwrap();
+        // (boringtun queues it and emits a handshake initiation). Datagrams on
+        // `to_network` are bounced between the two sides until both report a
+        // live session.
+        let mut to_router = phone.encapsulate(&ip).unwrap().to_network;
         for _ in 0..16 {
             if phone.is_connected() && router.is_connected() {
                 break;
             }
-            to_router.extend(phone.tick().unwrap().0);
+            to_router.extend(phone.tick().unwrap().to_network);
 
             let mut to_phone = Vec::new();
             for dg in to_router.drain(..) {
-                for out in router.handle_udp(&dg).unwrap() {
-                    if is_wireguard_datagram(&out) {
-                        to_phone.push(out);
-                    }
-                }
+                to_phone.extend(router.handle_udp(&dg).unwrap().to_network);
             }
-            to_phone.extend(router.tick().unwrap().0);
+            to_phone.extend(router.tick().unwrap().to_network);
 
             for dg in to_phone {
-                for out in phone.handle_udp(&dg).unwrap() {
-                    if is_wireguard_datagram(&out) {
-                        to_router.push(out);
-                    }
-                }
+                to_router.extend(phone.handle_udp(&dg).unwrap().to_network);
             }
         }
 
@@ -266,12 +265,20 @@ mod tests {
             "handshake did not complete"
         );
 
-        // A data packet encapsulated on the phone decrypts to the same
-        // plaintext on the router.
-        let datagram = phone.encapsulate(&ip).unwrap();
-        assert_eq!(datagram.len(), 1);
-        let decrypted = router.handle_udp(&datagram[0]).unwrap();
-        assert_eq!(decrypted[0], ip);
+        // A data packet encapsulated on the phone: the encrypted datagram is in
+        // `to_network` and nothing is destined for the local stack.
+        let outbound = phone.encapsulate(&ip).unwrap();
+        assert_eq!(outbound.to_network.len(), 1);
+        assert!(outbound.to_tunnel.is_empty());
+
+        // The peer decrypts it, surfacing the original plaintext in `to_tunnel`
+        // and nothing to send back.
+        let inbound = router.handle_udp(&outbound.to_network[0]).unwrap();
+        assert_eq!(inbound.to_tunnel, vec![ip]);
+        assert!(inbound.to_network.is_empty());
+
+        // `tick` is serviced on the caller's schedule: no deadline hint today.
+        assert!(phone.tick().unwrap().retry_after.is_none());
     }
 
     #[test]
