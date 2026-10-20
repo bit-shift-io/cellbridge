@@ -7,15 +7,20 @@ import android.net.NetworkRequest
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import java.net.DatagramSocket
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * The two transports the bridge depends on changing state.
  *
  * `up` is `true` when the transport's network appears ([NetworkBinder.onAvailable])
- * and `false` when it is lost ([NetworkBinder.onLost]). Callbacks are keyed on
- * the network's **transport**, never on a network identity, so a re-connected
- * radio that Android represents with a brand-new [Network] object still reports
- * `true`, and an unrelated network (a VPN, Ethernet) reports nothing at all.
+ * and `false` when it is lost ([NetworkBinder.onLost]).
+ *
+ * Which callback fires is decided by the **transport** the network carries, never
+ * by a network identity, so a re-connected radio that Android represents with a
+ * brand-new [Network] object still reports `true`, and an unrelated network (a
+ * VPN, Ethernet) reports nothing at all. Network identity is used *only* to
+ * correlate an `onLost` with the `onAvailable` that preceded it; see
+ * [NetworkBinder.onLost].
  */
 interface NetworkEvents {
     /** The cellular (internet-egress) side came up (`true`) or went down (`false`). */
@@ -57,14 +62,37 @@ class NetworkBinder(
     private val cm: ConnectivityManager,
     private val detachDescriptor: (DatagramSocket) -> Int = ::detachDatagramDescriptor,
 ) {
-    /** The listener for cellular/Wi-Fi changes. `null` drops the notifications. */
+    /**
+     * The listener for cellular/Wi-Fi changes. `null` drops the notifications.
+     *
+     * Written by the owner's thread and read from the connectivity handler
+     * thread, hence `@Volatile` so the hand-off is explicit.
+     */
+    @Volatile
     var events: NetworkEvents? = null
+
+    /**
+     * The transports each currently-available network carries, keyed by the exact
+     * [Network] object Android reported in `onAvailable`.
+     *
+     * The framework tears a network down *before* it delivers `onLost`, so by then
+     * `getNetworkCapabilities()` is already `null` and cannot be re-queried. This
+     * record is what `onLost` consults instead. Identity only correlates the down
+     * event with the up event that preceded it; which callback fires is still
+     * decided by the transport captured while the network was alive.
+     */
+    private val transportsByNetwork = HashMap<Network, Set<Int>>()
 
     /** Bridges the framework callback to the transport-aware `onAvailable`/`onLost`. */
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = this@NetworkBinder.onAvailable(network)
 
         override fun onLost(network: Network) = this@NetworkBinder.onLost(network)
+
+        override fun onCapabilitiesChanged(
+            network: Network,
+            capabilities: NetworkCapabilities,
+        ) = this@NetworkBinder.onCapabilitiesChanged(network, capabilities)
     }
 
     /**
@@ -90,13 +118,22 @@ class NetworkBinder(
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
 
+    /**
+     * Whether [start] has both registered. Written and read from the owner's
+     * thread, but marked `@Volatile` so re-entry and [stop] always see the final
+     * value.
+     */
+    @Volatile
     private var started = false
 
     /**
      * The DatagramSockets whose descriptor was handed to native code and that
      * Kotlin must therefore keep alive. See [bindWifiSocket].
+     *
+     * Written only from [bindWifiSocket], but the caller may be on any thread, so
+     * a concurrent map keeps that contract explicit.
      */
-    private val retained = HashMap<Int, DatagramSocket>()
+    private val retained = ConcurrentHashMap<Int, DatagramSocket>()
 
     /**
      * Begin observing the networks and holding cellular up. Idempotent.
@@ -108,7 +145,15 @@ class NetworkBinder(
             return
         }
         cm.requestNetwork(cellularRequest, cellularKeeper)
-        cm.registerNetworkCallback(observedRequest, callback)
+        try {
+            cm.registerNetworkCallback(observedRequest, callback)
+        } catch (e: RuntimeException) {
+            // The cellular request landed but observation did not start: release
+            // the keeper so a retry cannot leak it. `started` stays false, so a
+            // retry runs the whole sequence again.
+            cm.unregisterNetworkCallback(cellularKeeper)
+            throw e
+        }
         started = true
     }
 
@@ -167,7 +212,7 @@ class NetworkBinder(
      *   socket is closed here, which keeps the handover leak-free.
      * - API 24-28: `fromDatagramSocket` does **not** duplicate and instead shares
      *   the socket's descriptor. Closing (or finalizing) the socket would close
-     *   Rust's descriptor, so the socket is retained for the life of the process
+     *   Rust's descriptor, so the socket is retained for the life of this binder
      *   and deliberately never closed.
      */
     fun bindWifiSocket(network: Network): Int {
@@ -187,32 +232,73 @@ class NetworkBinder(
 
     /** A network of one of our transports came up; reports it, ignoring the rest. */
     fun onAvailable(network: Network) {
-        notifyTransport(network, up = true)
+        // Capture the transport now, while the network is still alive; `onLost`
+        // cannot re-query it later.
+        val capabilities = cm.getNetworkCapabilities(network) ?: return
+        val transports = transportsIn(capabilities)
+        transportsByNetwork[network] = transports
+        report(transports, up = true)
     }
 
-    /** A network of one of our transports was lost; reports it, ignoring the rest. */
+    /**
+     * Refresh the recorded transports for a network we already know about.
+     *
+     * Registered so the record tracks capability changes for the life of a
+     * network. A network we never saw available (and so have no reason to report
+     * on) is ignored.
+     */
+    fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+        if (transportsByNetwork.containsKey(network)) {
+            transportsByNetwork[network] = transportsIn(capabilities)
+        }
+    }
+
+    /**
+     * A network of one of our transports was lost; reports it, ignoring the rest.
+     *
+     * Deliberately does **not** call `getNetworkCapabilities()`: the framework has
+     * already removed the network by the time `onLost` is delivered, so that call
+     * returns `null`. Instead the transport recorded when the network came up is
+     * used, then pruned. Identity is the correlation key here, not a way to
+     * identify the transport — that still comes from the recorded capabilities.
+     */
     fun onLost(network: Network) {
-        notifyTransport(network, up = false)
+        val transports = transportsByNetwork.remove(network) ?: return
+        report(transports, up = false)
     }
 
+    /**
+     * Scan every network for one carrying [transport].
+     *
+     * `getAllNetworks` is deprecated as of API 31 with no non-deprecated drop-in
+     * for enumerating every network, so the deprecation is suppressed here.
+     */
+    @Suppress("DEPRECATION")
     private fun networkUsing(transport: Int): Network? =
         cm.allNetworks.firstOrNull { network ->
             cm.getNetworkCapabilities(network)?.hasTransport(transport) == true
         }
 
-    private fun notifyTransport(network: Network, up: Boolean) {
-        // Transport, not identity: whatever object Android reports, the event is
-        // decided by what the network is.
-        val capabilities = cm.getNetworkCapabilities(network) ?: return
+    /** Fire the listener for each [transports] entry we report on. */
+    private fun report(transports: Set<Int>, up: Boolean) {
         val listener = events ?: return
-
-        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+        if (NetworkCapabilities.TRANSPORT_CELLULAR in transports) {
             listener.onCellularChanged(up)
         }
-        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+        if (NetworkCapabilities.TRANSPORT_WIFI in transports) {
             listener.onWifiChanged(up)
         }
         // Every other transport (VPN, Ethernet, ...) reports nothing.
+    }
+
+    /** The subset of our transports that [capabilities] carries. */
+    private fun transportsIn(capabilities: NetworkCapabilities): Set<Int> = buildSet {
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            add(NetworkCapabilities.TRANSPORT_CELLULAR)
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            add(NetworkCapabilities.TRANSPORT_WIFI)
+        }
     }
 }
 

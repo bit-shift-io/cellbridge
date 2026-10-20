@@ -6,10 +6,12 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkInfo
 import android.os.Build
+import java.lang.ref.WeakReference
 import java.net.DatagramSocket
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -34,6 +36,9 @@ import org.robolectric.shadows.ShadowNetworkInfo
  * .fromDatagramSocket` needs the hidden `DatagramSocket.getFileDescriptor$()`.
  * Those tests therefore verify the *ownership* contract through an injected
  * handover, not a real fd.
+ *
+ * Robolectric also cannot fail a `registerNetworkCallback` on demand, so the
+ * `start()` failure-cleanup path has no unit test here (see the report).
  */
 // The Robolectric SDK is pinned rather than left to the harness default: without
 // `unitTests.isIncludeAndroidResources` Robolectric cannot read the manifest and
@@ -109,8 +114,14 @@ class NetworkBinderTest {
         assertEquals(listOf("cellular up"), recorder.calls)
     }
 
+    /**
+     * A down event follows an up event for the same network in the framework.
+     * Attaching the listener *after* the network came up also checks that the
+     * transport is remembered independently of who was listening at the time.
+     */
     @Test
     fun onLost_reports_the_cellular_transport() {
+        binder.onAvailable(cellular)
         val recorder = Recorder()
         binder.events = recorder
 
@@ -131,12 +142,36 @@ class NetworkBinderTest {
 
     @Test
     fun onLost_reports_the_wifi_transport() {
+        binder.onAvailable(wifi)
         val recorder = Recorder()
         binder.events = recorder
 
         binder.onLost(wifi)
 
         assertEquals(listOf("wifi down"), recorder.calls)
+    }
+
+    /**
+     * The framework delivers `onLost` only *after* the network is gone, so a
+     * re-query of `getNetworkCapabilities()` returns `null` at that point. The
+     * binder must remember the transport from `onAvailable` and report the down
+     * from that record — otherwise the bridge never learns its uplink died.
+     */
+    @Test
+    fun onLost_survives_the_capabilities_being_gone() {
+        binder.onAvailable(cellular)
+        binder.onAvailable(wifi)
+        // As the framework does when a network is torn down.
+        shadowOf(cm).setNetworkCapabilities(cellular, null)
+        shadowOf(cm).setNetworkCapabilities(wifi, null)
+
+        val recorder = Recorder()
+        binder.events = recorder
+
+        binder.onLost(cellular)
+        binder.onLost(wifi)
+
+        assertEquals(listOf("cellular down", "wifi down"), recorder.calls)
     }
 
     /**
@@ -243,20 +278,47 @@ class NetworkBinderTest {
      * and the DatagramSocket share one descriptor. The socket must therefore be
      * retained and never closed, or its finalizer could close the descriptor
      * Rust now owns.
+     *
+     * The handover lambda keeps only a *weak* reference to the socket, so the
+     * binder's retention map is the only thing that can keep it alive. The
+     * retention is asserted directly on that map — a GC probe alone would pass by
+     * luck if the object had not yet been collected, whereas the map check fails
+     * the instant `retained[fd] = socket` is removed.
      */
     @Test
     @Config(sdk = [28])
     fun before_api_29_the_socket_is_retained_so_its_finalizer_cannot_close_the_fd() {
         assertTrue(Build.VERSION.SDK_INT < Build.VERSION_CODES.Q)
 
-        var handedOver: DatagramSocket? = null
-        val binder = NetworkBinder(cm) { socket -> handedOver = socket; STUB_FD }
+        val socketRef = arrayOfNulls<WeakReference<DatagramSocket>>(1)
+        val binder = NetworkBinder(cm) { socket -> socketRef[0] = WeakReference(socket); STUB_FD }
 
         binder.bindWifiSocket(wifi)
 
-        assertFalse("the shared descriptor must stay open", requireNotNull(handedOver).isClosed)
+        System.gc()
+        System.runFinalization()
+
+        val socket = requireNotNull(socketRef[0]).get()
+        assertNotNull("the retained socket must stay reachable", socket)
+        assertFalse("the shared descriptor must stay open", socket!!.isClosed)
+
+        val retained = retainedSockets(binder)
+        assertTrue("the handed-over fd must be retained", STUB_FD in retained)
+        assertSame("retention must hold the exact socket handed over", socket, retained[STUB_FD])
     }
 
+    /** Reads the binder's private retention map; the mechanism under test. */
+    @Suppress("UNCHECKED_CAST")
+    private fun retainedSockets(binder: NetworkBinder): Map<Int, DatagramSocket> {
+        val field = NetworkBinder::class.java.getDeclaredField("retained")
+        field.isAccessible = true
+        return field.get(binder) as Map<Int, DatagramSocket>
+    }
+
+    // `ShadowConnectivityManager` keys networks on the legacy `NetworkInfo` type
+    // and has no non-deprecated way to register a bare network; the deprecated
+    // `NetworkInfo`/`ShadowNetworkInfo` API is used deliberately here only.
+    @Suppress("DEPRECATION")
     private fun addNetwork(id: Int, transport: Int?): Network {
         val network = ShadowNetwork.newInstance(id)
         val info = ShadowNetworkInfo.newInstance(
