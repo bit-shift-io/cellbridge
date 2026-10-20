@@ -5,12 +5,14 @@ mod frb_generated; /* AUTO INJECTED BY flutter_rust_bridge. This line may not be
 mod gateway;
 mod tcp;
 mod tunnel;
+mod udp;
 pub use api::*;
 pub use config::*;
 pub use device::*;
 pub use gateway::*;
 pub use tcp::*;
 pub use tunnel::*;
+pub use udp::*;
 
 use flutter_rust_bridge::frb;
 
