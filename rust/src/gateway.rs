@@ -218,7 +218,10 @@ fn syn_dst_port(pkt: &[u8]) -> Option<u16> {
 
     let tcp = &pkt[ip_header_len..];
     let is_pure_syn = tcp[13] & 0x02 != 0 && tcp[13] & 0x10 == 0 && tcp[13] & 0x04 == 0;
-    is_pure_syn.then(|| u16::from_be_bytes([tcp[2], tcp[3]]))
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    // Port 0 is not a valid destination and `listen(0)` fails, so it never
+    // reaches a listener.
+    (is_pure_syn && dst_port != 0).then_some(dst_port)
 }
 
 /// Convert a smoltcp endpoint into a standard socket address.
@@ -458,6 +461,26 @@ mod tests {
         g.push_rx(syn(client(), dst()));
         g.poll(Instant::now());
         assert_eq!(mss_of(&g.take_tx()[0]), 1360);
+    }
+
+    #[test]
+    fn syn_to_destination_port_zero_is_ignored() {
+        // Port 0 is not a valid destination; smoltcp's `listen(0)` fails, so a
+        // SYN carrying it must be dropped rather than reach a listener.
+        let mut g = Gateway::new(GW_ADDR, GW_PREFIX, MTU);
+        let dst: SocketAddr = "1.1.1.1:0".parse().unwrap();
+        g.push_rx(tcp_packet(
+            client(),
+            dst,
+            CLIENT_ISN,
+            None,
+            SYN,
+            &[],
+            Some(1460),
+        ));
+
+        let events = g.poll(Instant::now());
+        assert!(events.is_empty(), "a port-0 SYN is not a valid destination");
     }
 
     #[test]
