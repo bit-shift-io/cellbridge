@@ -1,40 +1,59 @@
 # CellBridge Architecture
 
-## 1. Network Topology & Routing Problem
-* **The Constraint:** Android forces a choice between Wi-Fi and Cellular. Standard apps bind to whichever network interface is active. Turning on a mobile hotspot drops local Wi-Fi, severing LAN access.
-* **The Solution:** CellBridge keeps the phone connected to Wi-Fi (`router.lan` / GL-BE9300 at `192.168.8.1`), spins up a local `tun0` interface via Android's `VpnService`, captures all internet-bound traffic, and pushes it through a UDP socket **explicitly pinned to the cellular interface**, connecting to the Flint 3 router's local WireGuard endpoint (`192.168.8.1:51820`).
+> This is a summary. The authoritative document is
+> [`docs/superpowers/specs/2026-10-20-cellbridge-design.md`](docs/superpowers/specs/2026-10-20-cellbridge-design.md).
 
-## 2. Component Interaction Diagram
+## 1. The problem
+
+The phone's cellular data is the only internet for the home network. The usual workaround
+turns the phone into a **Wi-Fi hotspot**, which drops its Wi-Fi client connection — so the
+phone loses access to everything on the LAN while it is sharing.
+
+## 2. The approach
+
+Keep the phone a **Wi-Fi client** of the Flint 3 (full LAN access retained) and make it the
+LAN's **internet exit**, reached over a WireGuard pipe across the existing Wi-Fi link.
 
 ```
-[Android Apps] ---> (tun0 virtual interface)
-                         │
-                         ▼
-             [Android VpnService (Kotlin)]
-                         │
-             (Passes FD & Cellular Socket)
-                         │
-                         ▼
-             [Flutter-Rust Bridge]
-                         │
-                         ▼
-             [Rust Core (boringtun)] ---> (Encrypted UDP Packets)
-                                                 │
-                   ┌─────────────────────────────┘
-                   ▼ (Pinned via ConnectivityManager to Cellular)
-             [Cellular Data Network] ---> [GL-BE9300 / Flint 3 (WireGuard Server)]
-                                                  │
-                                                  ▼
-                                         [Bridged to Home LAN / WAN]
+   LAN clients                                   Phone (Wi-Fi client, no root)
+   (192.168.8.0/24)                              ┌──────────────────────────────┐
+        │                                        │ Flutter UI                   │
+        │ internet-bound                         │   └─ Foreground Service       │
+        ▼                                        │ Kotlin: net + socket binding │
+   ┌──────────────────────┐   WireGuard (UDP)    │ Rust: boringtun + userspace  │
+   │ Flint 3 (192.168.8.1)│◄────────────────────►│       IP gateway (smoltcp)   │
+   │  default route via   │  over home Wi-Fi     │        │                     │
+   │  the phone's peer    │                      │        ▼ cellular-bound      │
+   │  masquerade, MSS     │                      │          sockets             │
+   └──────────────────────┘                      └────────┼─────────────────────┘
+                                                          ▼
+                                                  Cellular data → Internet
 ```
 
-## 3. Data Flow Step-by-Step
-1. **App Traffic Generation:** Any app on your phone requests data. Android routes it into the virtual `tun0` interface created by `VpnService`.
-2. **Rust Ingestion:** The Rust core (`boringtun`) reads the raw IP packets from `tun0`, packages them, and encrypts them using the WireGuard protocol.
-3. **Cellular Pinning:** The encrypted UDP packets are sent out through a socket that the Android platform code explicitly bound to the active `TRANSPORT_CELLULAR` network interface.
-4. **Local Transport via Wi-Fi LAN:** The underlying IP packet payload (addressed to `192.168.8.1:51820`) travels over your home Wi-Fi network to the GL-BE9300 router. Because it's just a standard UDP destination on your local subnet, it bypasses Android's default gateway restriction without triggering a loop.
-5. **Router Decapsulation & Bridging:** The GL-BE9300 receives the packet on its WireGuard server interface, decrypts it, applies IP Masquerading, and pushes the data out to its WAN or bridges it across your home network.
+## 3. Components
 
-## 4. Security & Isolation Rules
-* **Local LAN Bypass:** Subnet traffic (e.g., `192.168.8.0/24`) bypasses the VPN tunnel entirely, allowing your phone to communicate directly with local home servers, printers, and devices over Wi-Fi.
-* **Cellular Exclusivity:** All external internet traffic (`0.0.0.0/0`) is captured by `tun0`, encrypted in Rust, and forced out over mobile data.
+1. **Flutter UI (`lib/`)** — dashboard and WireGuard configuration; a view over Rust state.
+2. **Android platform layer (`android/`)** — foreground service with start-on-boot, plus
+   the `ConnectivityManager` work an unrooted Rust process cannot do: request a cellular
+   network, bind the process to it, and bind the WireGuard socket to Wi-Fi.
+3. **Rust core (`rust/`)** — `boringtun` for the tunnel; `smoltcp` as a userspace IPv4
+   stack that terminates TCP; a packet-level UDP forwarder; splicing to real sockets.
+4. **Router (`router/`)** — OpenWrt config that routes the LAN's internet into the phone's
+   peer and masquerades it.
+
+## 4. Data flow
+
+1. A LAN client sends internet-bound traffic; the router's default route points it into
+   the `wg0` tunnel, masqueraded to the phone's tunnel address.
+2. `boringtun` on the phone decrypts it into inner IP packets.
+3. **TCP** is terminated by `smoltcp` and spliced to a real cellular-bound socket.
+   **UDP** is rewritten at the packet level, preserving the client's destination port.
+4. Replies travel back out the tunnel, the router de-NATs, and the client receives them.
+
+## 5. Key properties
+
+* **No root, no `VpnService`, no `tun0`** — the phone only ever uses ordinary app sockets.
+* **The hard part is on the phone** — a userspace TCP/IP gateway, because Android will not
+  NAT another device's traffic without root.
+* **Fail-closed** — there is no backup uplink; the phone being absent means no internet.
+* **Transport, not privacy** — WireGuard is used because the router speaks it natively.

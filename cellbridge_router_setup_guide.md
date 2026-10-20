@@ -1,71 +1,60 @@
 # GL.iNet GL-BE9300 (Flint 3) Configuration for CellBridge
 
-To use your GL-BE9300 router as the landing gateway for **CellBridge**, follow these steps to configure the built-in WireGuard server on your router.
+In this setup the Flint 3 does **not** use a normal WAN uplink. The phone — a Wi-Fi
+**client** of the Flint 3 — is the internet exit, and the LAN's traffic is routed into a
+WireGuard tunnel to the phone.
 
----
+> The router side is delivered as scripts, not manual UI steps: see
+> `router/cellbridge-setup.sh` and `router/cellbridge-revert.sh`. GL.iNet's
+> WireGuard-**server** UI is built for the opposite direction (clients borrowing the
+> router's internet) and cannot express "route the LAN out through a peer".
 
-## 1. Initialize the WireGuard Server
+## 1. Prerequisites
 
-1. Open your browser and log into the GL-BE9300 admin panel (default: `http://192.168.8.1`).
-2. In the left sidebar, navigate to **VPN** -> **WireGuard Server**.
-3. Under the **Configuration** tab:
-   * **Status:** Toggle **ON**.
-   * **Listen Port:** `51820` (default).
-   * **Interface IP:** Note the tunnel subnet address (usually `10.0.0.1` or `10.1.0.1`).
-   * **Endpoint:** Keep track of your router's local IP address (`192.168.8.1:51820`).
+* SSH access to the Flint 3 (`ssh root@192.168.8.1`).
+* A WireGuard key pair for the phone — the app generates and holds the private key.
+* The old WAN uplink identified, so it can be disabled.
 
----
+## 2. What the setup script configures
 
-## 2. Server Advanced Options & Toggles
-
-Under the server options/settings panel, ensure the following parameters are set:
-
-* **Allow Remote Access to the LAN Subnet:** `ENABLED` (Checked)
-  * *Crucial so your phone can communicate directly with devices on your `192.168.8.0/24` home network.*
-* **IP Masquerading (NAT):** `ENABLED` (Checked)
-  * *Ensures proper translation of packets flowing through the tunnel.*
-* **MTU:** `1420` (or leave as default/1280)
-  * *Prevents packet fragmentation.*
-* **Client to Client:** `DISABLED` (Unchecked)
-  * *Not required for single-device bridging.*
-
----
-
-## 3. Route Rules Tab
-
-* **Route Rules Table:** `LEAVE BLANK`
-  * *No custom route entries are required on the router. CellBridge handles client-side intercept and routing locally on the Android device.*
-
----
-
-## 4. Create Client Profile for CellBridge
-
-1. Select the **Profiles** tab under **WireGuard Server**.
-2. Click **Add New Profile / User**.
-3. Name the profile: `CellBridge` (or `android-bridge`).
-4. Save the profile and click **Configurations** to view the generated credentials.
-5. Extract the following 4 parameters for your CellBridge app configuration:
-
-| Setting | Example Value | Description |
+| Setting | Value | Why |
 | :--- | :--- | :--- |
-| **`PrivateKey`** | `aB3x...` | Your Android phone's client key |
-| **`Address`** | `10.0.0.2/32` | Internal tunnel IP assigned to your phone |
-| **`PublicKey`** | `xY9z...` | Flint 3 WireGuard Server Public Key |
-| **`Endpoint`** | `192.168.8.1:51820` | Local LAN address of your Flint 3 router |
+| Interface | `wg0`, proto `wireguard` | the tunnel |
+| Tunnel address | `10.10.10.1/24` | the router's end of the tunnel |
+| Listen port | `51820` | the phone connects here |
+| MTU | `1420` | avoids fragmentation over Wi-Fi |
+| Peer | the phone, `allowed_ips 0.0.0.0/0`, `route_allowed_ips 1` | installs the **default route** via the tunnel |
+| Firewall zone | `vpn` for `wg0`, **masquerade ON**, **MSS clamping ON** | LAN clients appear to the phone as a single address |
+| dnsmasq | upstream set to a public resolver | DNS is carried through the tunnel like any other UDP |
+| Old WAN | **disabled** | the tunnel is the only path (fail-closed) |
 
----
+The **phone initiates** the handshake, so the router learns the peer's endpoint by itself.
+No static lease or fixed phone IP is required.
 
-## Technical Summary of Traffic Flow
+## 3. Reverting
+
+`router/cellbridge-revert.sh` restores the previous WAN, firewall and DNS state and removes
+`wg0`. This is the **only** recovery path and it is manual — if the phone is away, the LAN
+has no internet by design.
+
+## 4. Values the phone app needs
+
+| Setting | Example | Notes |
+| :--- | :--- | :--- |
+| `PrivateKey` | *generated in the app* | never leaves the phone |
+| `Address` | `10.10.10.2/24` | the phone's tunnel IP |
+| `PublicKey` | the router's `wg0` public key | printed by the setup script |
+| `Endpoint` | `192.168.8.1:51820` | the router on the LAN |
+| `MTU` | `1420` | |
+
+## 5. Traffic flow
 
 ```
-[Android Phone] ──(Cellular Interface)──> [Rust BoringTun Engine]
-                                                  │
-                                   (Local Wi-Fi UDP Socket)
-                                                  │
-                                                  ▼
-                                     [Flint 3 WireGuard Server]
-                                       (192.168.8.1:51820)
-                                                  │
-                                                  ▼
-                                     [Home LAN Subnet Bridge]
+[LAN client] ──▶ [Flint 3: default route via wg0, masquerade]
+                        │
+                        ▼  WireGuard over Wi-Fi
+              [Phone: boringtun → userspace gateway → cellular sockets]
+                        │
+                        ▼
+                    [Internet]
 ```

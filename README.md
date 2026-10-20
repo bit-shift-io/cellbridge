@@ -1,15 +1,50 @@
 # CellBridge
 
-**CellBridge** is an advanced, high-performance Android application built with **Flutter** and a **Rust core** (`flutter_rust_bridge`). It solves a classic Android networking constraint: allowing an Android device to stay connected to home Wi-Fi (retaining full local LAN access) while seamlessly tunneling all cellular data internet traffic directly into an OpenWrt router (**GL.iNet GL-BE9300 / Flint 3**) via an embedded WireGuard client.
+**CellBridge** is a rootless Android app that lets a phone share its **cellular** internet
+with a home LAN while staying an ordinary **Wi-Fi client** of the router — so the phone
+keeps full LAN access (NAS, printers, local servers) that a hotspot would take away.
 
-## Core Architecture
-1. **Flutter Frontend:** Provides the UI control panel, system VPN permission requests (`VpnService`), and manages the Android Foreground Service lifecycle.
-2. **Android Platform Layer (Kotlin):** Establishes the virtual TUN interface (`tun0`), queries Android's `ConnectivityManager` to find the active **Cellular** network interface, and explicitly binds outgoing UDP sockets to mobile data to avoid routing loops.
-3. **Rust Core (`flutter_rust_bridge` + `boringtun`):** Handles raw IP packet ingestion from `tun0`, WireGuard encryption/decapsulation, and streaming data over the local network to the Flint 3 router.
-4. **Router Endpoint (OpenWrt / Flint 3):** Acts as the WireGuard server gateway (`router.lan`), ingesting cellular data and routing it upstream while bridging local LAN traffic.
+It replaces the usual "phone hotspot → second router → Flint 3 WAN" chain with a single
+app. The router routes the LAN's internet traffic into a **WireGuard** pipe to the phone;
+the phone re-originates it on its cellular radio.
 
-## Project Structure
-* `android/`: Native Kotlin implementation for `VpnService` and network socket binding.
-* `lib/`: Flutter UI and state management.
-* `rust/`: Rust core library wrapping `boringtun` and managing packet flow.
-* `docs/`: Technical specifications and developer guidelines.
+> **Status:** design and implementation plan complete; implementation not started.
+> See [`docs/superpowers/specs/2026-10-20-cellbridge-design.md`](docs/superpowers/specs/2026-10-20-cellbridge-design.md)
+> and [`docs/superpowers/plans/2026-10-20-cellbridge.md`](docs/superpowers/plans/2026-10-20-cellbridge.md).
+
+## How it works
+
+```
+LAN clients ──▶ Flint 3 ──WireGuard over Wi-Fi──▶ Phone ──▶ Cellular ──▶ Internet
+```
+
+- The **router** treats the phone as its upstream: the LAN's `0.0.0.0/0` is routed into
+  the WireGuard peer and masqueraded.
+- The **phone** terminates the tunnel in Rust (`boringtun`) and runs a userspace IPv4
+  gateway (`smoltcp`) that terminates TCP and rewrites UDP, re-originating every flow on
+  ordinary sockets bound to the cellular network.
+
+Because the phone originates the connections itself, **no root is required** and no
+`VpnService`/`tun0` is involved.
+
+## Capabilities and limits
+
+| | |
+|---|---|
+| **Works** | All TCP and UDP ports — browsing, QUIC, DNS, games, VoIP, torrents |
+| **Best-effort** | ICMP echo to the internet |
+| **Out of scope** | Raw protocols (GRE/ESP), IPv6, root, USB/Bluetooth tethering |
+| **Fail-closed** | If the phone is absent the LAN has no internet — by design |
+
+## Project structure
+
+* `lib/` — Flutter UI (dashboard, configuration).
+* `android/` — Kotlin platform layer: foreground service, `ConnectivityManager`, socket binding.
+* `rust/` — Rust core: `boringtun` tunnel, `smoltcp` gateway, TCP/UDP proxy engine.
+* `router/` — OpenWrt (Flint 3) setup and revert scripts.
+* `docs/` — the design spec and implementation plan.
+
+## Hardware
+
+* **Router:** GL.iNet GL-BE9300 (Flint 3), stock firmware, SSH access.
+* **Phone:** Google Pixel 8, current Android, unrooted, sideloaded build.

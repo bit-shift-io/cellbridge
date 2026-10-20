@@ -1,38 +1,51 @@
 # CellBridge Developer Guide
 
 ## Prerequisites
-* Flutter SDK (Latest Stable)
-* Rust Toolchain (`cargo`, `rustup`, cross-compilation targets for Android: `aarch64-linux-android`, etc.)
-* Android SDK / NDK installed.
-* `flutter_rust_bridge_codegen` installed.
 
-## Step-by-Step Implementation Plan
+* Flutter SDK (stable), 3.47 or newer.
+* Rust toolchain with the Android targets: `aarch64-linux-android` (and
+  `x86_64-linux-android` for emulators).
+* Android SDK + NDK; a Pixel 8 (or another arm64 device) for on-device testing.
+* `flutter_rust_bridge_codegen` 2.13.
+* SSH access to the Flint 3.
 
-### Step 1: Android Platform Layer (`android/`)
-1. Create a `VpnService` subclass in Kotlin (`CellBridgeVpnService.kt`).
-2. Implement methods to:
-   * Prepare and start the VPN interface (`tun0`, setting appropriate MTU, e.g., 1280, and adding routing rules for `0.0.0.0/0`).
-   * Query `ConnectivityManager` to locate the active `TRANSPORT_CELLULAR` network.
-   * Bind outgoing UDP sockets using `cellularNetwork.bindSocket(socket)` to force cellular routing.
-3. Expose methods via Platform Channels or direct callback structures to pass the TUN file descriptor (`ParcelFileDescriptor`) and socket handle to Rust.
+## Getting started
 
-### Step 2: Rust Core (`rust/src/`)
-1. Integrate `boringtun` (or a lightweight Rust WireGuard implementation) as a cargo dependency.
-2. Define the bridge API via `flutter_rust_bridge`:
-   * `fn start_tunnel(tun_fd: i32, config: WireGuardConfig, cellular_socket_fd: i32)`
-   * `fn stop_tunnel()`
-3. In Rust, read raw IP packets from the TUN file descriptor, pass them to the WireGuard state machine, and write encrypted output to the cellular-bound UDP socket.
+Implementation follows the plan:
+[`docs/superpowers/plans/2026-10-20-cellbridge.md`](docs/superpowers/plans/2026-10-20-cellbridge.md).
+Build it task by task — the plan carries the exact files, interfaces, test assertions and
+commits.
 
-### Step 3: Flutter UI (`lib/`)
-1. Build a clean, minimalist dashboard featuring:
-   * Connection toggle switch.
-   * Live connection status indicator (Connected/Disconnected/Connecting).
-   * Traffic stats (Bytes sent/received).
-2. Invoke `VpnService.prepare()` from Dart before starting the native service.
+The shape of the work:
 
-## Router Configuration (GL-BE9300 / Flint 3)
-1. Log into your Flint 3 admin panel (`192.168.8.1`).
-2. Navigate to **VPN** -> **WireGuard Server** and start the server.
-3. Create a client profile (`cellbridge-phone`).
-4. Ensure **Allow Access Local Network** is enabled.
-5. Note the `PrivateKey`, `Address`, `PublicKey`, and `Endpoint` (`192.168.8.1:51820`) for your Rust WireGuard client configuration.
+### 1. Rust core (`rust/`) — Tasks 2–8
+
+* `tunnel.rs` — the `boringtun` WireGuard state machine.
+* `device.rs` / `gateway.rs` — a `smoltcp` IPv4 stack in **any-IP** mode that terminates TCP.
+* `tcp.rs` — splice between `smoltcp` sockets and real, cellular-bound sockets.
+* `udp.rs` — packet-level UDP forwarding that preserves the client's destination port.
+* The core is **host-testable**: `cargo test --manifest-path rust/Cargo.toml`.
+
+### 2. Android platform layer (`android/`) — Tasks 9–11
+
+* `NetworkBinder.kt` — request a `TRANSPORT_CELLULAR` network, `bindProcessToNetwork`, and
+  bind the WireGuard socket to **Wi-Fi** (using `ParcelFileDescriptor.fromDatagramSocket`).
+* `BridgeService.kt` — foreground service (`specialUse` type) plus a `BOOT_COMPLETED` receiver.
+* Pass the WireGuard socket fd into Rust. Never use `getFileDescriptor$()` reflection.
+
+### 3. Flutter UI (`lib/`) — Tasks 12–13
+
+* Dashboard: connect/disconnect, status, bytes in/out, active flows.
+* Config: WireGuard keys, tunnel address, endpoint.
+
+### 4. Router (`router/`) — Task 14
+
+* `cellbridge-setup.sh` and `cellbridge-revert.sh` — see
+  [`cellbridge_router_setup_guide.md`](cellbridge_router_setup_guide.md).
+
+## Testing
+
+* Rust: `cargo test --manifest-path rust/Cargo.toml` (unit tests + `tests/loopback.rs`).
+* Kotlin: `./gradlew :app:testDebugUnitTest`.
+* Flutter: `flutter test`.
+* End-to-end, throughput, boot and soak: plan Task 15.

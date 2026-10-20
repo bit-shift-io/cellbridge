@@ -1,23 +1,35 @@
 # CellBridge Task Tracker & Roadmap
 
-## Phase 1: Skeleton & Project Scaffolding
-- [ ] Initialize Flutter project with Rust integration (`flutter_rust_bridge`).
-- [ ] Configure `pubspec.yaml` and `Cargo.toml` with necessary dependencies (`boringtun`, `tokio`, etc.).
-- [ ] Set up basic UI layout in Flutter with start/stop toggle state.
+Full detail — files, interfaces, test assertions, commits — lives in the plan:
+[`docs/superpowers/plans/2026-10-20-cellbridge.md`](docs/superpowers/plans/2026-10-20-cellbridge.md).
+This file tracks progress only.
 
-## Phase 2: Android Native Plumbing (`VpnService` & Socket Binding)
-- [ ] Implement `CellBridgeVpnService.kt` in Android Java/Kotlin.
-- [ ] Implement network query logic using `ConnectivityManager` to target `TRANSPORT_CELLULAR`.
-- [ ] Implement explicit socket binding to force cellular transport interface.
-- [ ] Expose TUN file descriptor passing mechanism to Rust.
+## Phase A — Rust core (host-testable)
 
-## Phase 3: Rust Core & WireGuard Tunneling
-- [ ] Set up `flutter_rust_bridge` bindings for lifecycle control.
-- [ ] Integrate `boringtun` packet processing loop with the TUN file descriptor.
-- [ ] Wire up UDP socket communication with the pinned cellular socket handle.
-- [ ] Validate handshake with the GL-BE9300 OpenWrt WireGuard server.
+- [ ] Task 1: Scaffold Flutter + Rust + FRB round-trip
+- [ ] Task 2: `Tunnel` — boringtun wrapper
+- [ ] Task 3: `QueueDevice` — smoltcp device over queues
+- [ ] Task 4: `Gateway` — smoltcp TCP listener in any-IP mode
+- [ ] Task 5: TCP splice engine
+- [ ] Task 6: UDP packet-level forwarder
+- [ ] Task 7: Full loopback integration
+- [ ] Task 8: Stats, status, and teardown on tunnel loss
 
-## Phase 4: Testing & Hardening
-- [ ] Verify local LAN accessibility (`router.lan` devices reachable while connected).
-- [ ] Verify internet traffic routing exclusively through mobile data.
-- [ ] Handle background lifecycle events and Android Doze mode gracefully with a Foreground Service notification.
+## Phase B — Android platform layer
+
+- [ ] Task 9: Kotlin `NetworkBinder`
+- [ ] Task 10: `BridgeService` + boot receiver
+- [ ] Task 11: FRB lifecycle wiring
+
+## Phase C — Flutter UI
+
+- [ ] Task 12: Dashboard
+- [ ] Task 13: Config screen + settings store
+
+## Phase D — Router
+
+- [ ] Task 14: Router setup + revert scripts
+
+## Phase E — Verification
+
+- [ ] Task 15: On-device end-to-end, throughput, boot, soak
