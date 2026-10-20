@@ -40,6 +40,10 @@ android {
 }
 
 dependencies {
+    // EncryptedSharedPreferences, so the WireGuard private key is not readable at
+    // rest. There is deliberately no plaintext SharedPreferences fallback.
+    implementation("androidx.security:security-crypto:1.1.0")
+
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.17")
 }

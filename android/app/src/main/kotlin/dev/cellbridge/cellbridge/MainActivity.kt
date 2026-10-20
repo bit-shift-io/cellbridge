@@ -1,5 +1,27 @@
 package dev.cellbridge.cellbridge
 
+import dev.cellbridge.ConfigStoreHandler
+import dev.cellbridge.EncryptedConfigStore
+import dev.cellbridge.SETTINGS_CHANNEL
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
 
-class MainActivity : FlutterActivity()
+class MainActivity : FlutterActivity() {
+
+    /**
+     * Register the settings channel on the engine that runs the app.
+     *
+     * `super` runs the generated plugin registrant first, so the engine is
+     * fully configured before our handler is attached. The store is created
+     * here (once) and fails loudly if the encrypted store cannot be opened;
+     * there is no plaintext fallback.
+     */
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+
+        val store = EncryptedConfigStore(applicationContext)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SETTINGS_CHANNEL)
+            .setMethodCallHandler(ConfigStoreHandler(store))
+    }
+}
