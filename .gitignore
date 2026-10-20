@@ -124,3 +124,8 @@ app.*.symbols
 !**/ios/**/default.perspectivev3
 !/packages/flutter_tools/test/data/dart_dependencies_test/**/.packages
 !/dev/ci/**/Gemfile.lock
+
+# Lockfiles are committed for this application (the blanket `*.lock` rule above
+# would otherwise ignore them).
+!rust/Cargo.lock
+!pubspec.lock
