@@ -67,5 +67,9 @@ class FrbBridgeApi implements BridgeApi {
   Stats stats() => rust.stats();
 }
 
-/// The production bridge implementation.
-BridgeApi get bridgeApi => const FrbBridgeApi();
+/// The current bridge implementation.
+///
+/// Settable so the Android service can supply the Wi-Fi-bound socket descriptor
+/// (`bridgeApi = FrbBridgeApi(wgSocketFd: fd)`) and so widget tests or the Linux
+/// demo can inject a fake. The default is the production, fd-less desktop path.
+BridgeApi bridgeApi = const FrbBridgeApi();

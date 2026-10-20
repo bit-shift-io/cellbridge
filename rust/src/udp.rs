@@ -238,6 +238,20 @@ impl UdpForwarder {
         std::mem::take(&mut self.flows).into_keys().collect()
     }
 
+    /// Forget one flow, for example because the caller closed its socket.
+    ///
+    /// Unlike idle expiry this is immediate, so a flow whose socket was dropped
+    /// or evicted stops counting toward `active_flows` at once instead of
+    /// lingering until the next [`Self::expire`]. Removing an untracked flow is
+    /// harmless and returns `false`.
+    pub fn remove(&mut self, flow: &FlowId) -> bool {
+        let Some(tracked) = self.flows.remove(flow) else {
+            return false;
+        };
+        self.by_activity.remove(&(tracked.last_seen, tracked.seq));
+        true
+    }
+
     /// Remove flows that have been idle for at least the configured timeout.
     ///
     /// `now` is expected to come from the same clock as the `Instant::now()`
@@ -1041,6 +1055,30 @@ mod tests {
         let stats = counters.snapshot(f.len());
         assert_eq!(stats.rx_bytes, 0, "an undeliverable reply moves no bytes");
         assert_eq!(stats.tx_bytes, 1, "the request that did go out is counted");
+    }
+
+    #[test]
+    fn removing_a_flow_is_immediate_and_frees_its_capacity() {
+        let mut f = UdpForwarder::new(1, Duration::from_secs(30));
+        let flow = f
+            .handle_outbound(&client_packet(53000, dst(), b"a"))
+            .unwrap()
+            .flow;
+        assert_eq!(f.len(), 1);
+
+        assert!(f.remove(&flow), "the tracked flow is removed");
+        assert_eq!(f.len(), 0, "the live count drops immediately");
+        assert!(!f.remove(&flow), "removing again is harmless");
+
+        // The eviction index was cleaned up too: a new flow fits without
+        // evicting anything, and expiry cannot resurrect a stale entry.
+        let next = f
+            .handle_outbound(&client_packet(53001, dst(), b"b"))
+            .expect("the freed capacity accepts a new flow");
+        assert_eq!(f.len(), 1);
+        f.expire(Instant::now() + Duration::from_secs(31));
+        assert!(f.is_empty(), "only the new flow expires");
+        assert_ne!(next.flow, flow);
     }
 
     #[test]

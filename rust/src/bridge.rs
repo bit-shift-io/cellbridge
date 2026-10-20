@@ -113,7 +113,9 @@ impl Shared {
 ///
 /// A poisoned status mutex must not turn a status read into a second panic.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A running bridge task.
@@ -203,11 +205,7 @@ pub async fn start(cfg: BridgeConfig, wg_socket_fd: Option<i32>) -> Result<(), S
         tunnel,
         gateway: Gateway::new(address, prefix_len, usize::from(cfg.mtu)),
         engine: TcpSpliceEngine::with_counters(Arc::clone(&counters)),
-        udp: UdpForwarder::with_counters(
-            UDP_MAX_FLOWS,
-            UDP_IDLE_TIMEOUT,
-            Arc::clone(&counters),
-        ),
+        udp: UdpForwarder::with_counters(UDP_MAX_FLOWS, UDP_IDLE_TIMEOUT, Arc::clone(&counters)),
         monitor: BridgeMonitor::new(HANDSHAKE_GRACE),
         tunnel_socket,
         endpoint,
@@ -224,7 +222,10 @@ pub async fn start(cfg: BridgeConfig, wg_socket_fd: Option<i32>) -> Result<(), S
         error: None,
     });
     let join = tokio::spawn(bridge.run(stop_rx));
-    *lock(&RUNNING) = Some(Running { stop: stop_tx, join });
+    *lock(&RUNNING) = Some(Running {
+        stop: stop_tx,
+        join,
+    });
     Ok(())
 }
 
@@ -360,6 +361,11 @@ struct BridgeLoop {
 impl BridgeLoop {
     /// Drive the data path until `stop` fires.
     async fn run(mut self, mut stop: oneshot::Receiver<()>) {
+        // Enter `Connecting` before the first publish. Without this the monitor
+        // would stay `Idle`, `observe` would early-return, and the loop would
+        // overwrite the state `start` set with `Idle` on its very first tick.
+        self.monitor.start();
+
         let mut ticker = tokio::time::interval(TICK_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut datagram = vec![0u8; MAX_DATAGRAM];
@@ -599,11 +605,9 @@ impl BridgeLoop {
         });
     }
 
-    /// Drop one flow's socket, aborting its reader.
+    /// Drop one flow's socket and its forwarder bookkeeping together.
     fn drop_flow(&mut self, flow: FlowId) {
-        if let Some(sockets) = self.flows.remove(&flow) {
-            sockets.reader.abort();
-        }
+        release_flow(&mut self.udp, &mut self.flows, flow);
     }
 
     /// Evict the least recently used flow socket; false when there is none.
@@ -622,10 +626,9 @@ impl BridgeLoop {
 
     /// Publish the current status and live flow count for the FRB getters.
     fn publish(&self) {
-        self.shared.active_flows.store(
-            self.engine.flow_count() + self.udp.len(),
-            Ordering::Relaxed,
-        );
+        self.shared
+            .active_flows
+            .store(self.engine.flow_count() + self.udp.len(), Ordering::Relaxed);
         self.shared.set_status(self.monitor.status());
     }
 
@@ -637,6 +640,18 @@ impl BridgeLoop {
         self.udp.tear_down_all();
         self.engine.tear_down_all();
     }
+}
+
+/// Drop a flow's socket and its forwarder bookkeeping together.
+///
+/// Keeping the two in step is what makes `active_flows` honest: a socket that
+/// is gone must stop being counted immediately, not linger in the forwarder's
+/// table until the next idle expiry.
+fn release_flow(udp: &mut UdpForwarder, flows: &mut HashMap<FlowId, FlowSockets>, flow: FlowId) {
+    if let Some(sockets) = flows.remove(&flow) {
+        sockets.reader.abort();
+    }
+    udp.remove(&flow);
 }
 
 /// Apply a splice operation to the gateway.
@@ -732,6 +747,21 @@ mod tests {
         "192.0.2.1:51820"
     }
 
+    /// A minimal valid inner IPv4/UDP packet, enough for `handle_outbound`.
+    fn outbound_udp_packet() -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45; // IPv4, 20-byte header
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17; // UDP
+        packet[12..16].copy_from_slice(&[10, 10, 10, 1]);
+        packet[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        packet[20..22].copy_from_slice(&53000u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&8u16.to_be_bytes());
+        packet
+    }
+
     #[tokio::test]
     async fn start_without_a_socket_fd_reports_connecting_and_stop_resets() {
         let _serial = TEST_LOCK.lock().await;
@@ -741,8 +771,10 @@ mod tests {
             .await
             .expect("the Linux (no fd) path starts");
 
-        // The grace period is ten seconds, so this assertion is nowhere near
-        // the never-connected -> Error transition.
+        // Yield past several loop ticks so this reads what the loop publishes,
+        // not the value `start_bridge` wrote before spawning it. The monitor
+        // stays `Connecting` until the grace period elapses.
+        tokio::time::sleep(TICK_INTERVAL * 3).await;
         assert_eq!(status().state, BridgeState::Connecting);
         assert_eq!(stats(), Stats::default(), "a fresh run starts at zero");
 
@@ -796,6 +828,39 @@ mod tests {
         assert!(!is_running());
     }
 
+    /// A bridge that can never reach its endpoint must not sit in `Connecting`
+    /// forever: the monitor's grace period has to run from `start`, which only
+    /// happens if the loop calls `BridgeMonitor::start`.
+    #[tokio::test]
+    async fn a_never_connected_bridge_surfaces_error_after_the_grace() {
+        let _serial = TEST_LOCK.lock().await;
+        let _ = stop_bridge().await;
+
+        start_bridge(config(unreachable_endpoint()), None)
+            .await
+            .expect("start");
+
+        tokio::time::sleep(HANDSHAKE_GRACE + Duration::from_secs(1)).await;
+
+        let status = status();
+        assert_eq!(
+            status.state,
+            BridgeState::Error,
+            "the never-connected path must surface an error after the grace"
+        );
+        let error = status.error.expect("an error carries a reason");
+        assert!(
+            error.contains("handshake"),
+            "the reason explains the missing handshake: {error}"
+        );
+        assert!(
+            is_running(),
+            "the loop keeps running so it can recover when the peer answers"
+        );
+
+        stop_bridge().await.expect("stop");
+    }
+
     #[tokio::test]
     async fn stopping_while_connecting_leaves_no_task_running() {
         let _serial = TEST_LOCK.lock().await;
@@ -820,6 +885,40 @@ mod tests {
             .expect("start again after stop");
         stop_bridge().await.expect("stop again");
         assert!(!is_running());
+    }
+
+    #[tokio::test]
+    async fn releasing_a_flow_keeps_active_flows_honest() {
+        let _serial = TEST_LOCK.lock().await;
+
+        let counters = Arc::new(StatsCounters::new());
+        let mut udp = UdpForwarder::with_counters(8, UDP_IDLE_TIMEOUT, Arc::clone(&counters));
+        let outbound = udp
+            .handle_outbound(&outbound_udp_packet())
+            .expect("a valid packet is forwarded");
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let reader = tokio::spawn(async {});
+        let mut flows = HashMap::new();
+        flows.insert(
+            outbound.flow,
+            FlowSockets {
+                socket,
+                reader,
+                last_seen: Instant::now(),
+            },
+        );
+        assert_eq!(counters.snapshot(udp.len()).active_flows, 1);
+
+        release_flow(&mut udp, &mut flows, outbound.flow);
+
+        assert_eq!(udp.len(), 0, "the dropped flow stops counting immediately");
+        assert_eq!(
+            counters.snapshot(udp.len()).active_flows,
+            0,
+            "active_flows is honest without waiting for idle expiry"
+        );
+        assert!(flows.is_empty(), "the socket entry is gone too");
     }
 
     #[tokio::test]

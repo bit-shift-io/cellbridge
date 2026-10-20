@@ -18,7 +18,20 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 use crate::device::QueueDevice;
 
 /// Receive/transmit buffer size for each TCP socket.
-const TCP_BUFFER_SIZE: usize = 8192;
+///
+/// This is the per-connection window, and therefore the throughput ceiling:
+/// roughly `TCP_BUFFER_SIZE / RTT`. The bridge's goal is at least 40 Mb/s, and
+/// the end-to-end RTT through a phone on cellular is commonly 20–40 ms. 8 KiB
+/// (the original value) allowed only ~2–3 Mb/s; 128 KiB allows roughly 52 Mb/s
+/// at 20 ms and ~26 Mb/s at 40 ms, and 105 Mb/s on the Wi-Fi leg. Do not shrink
+/// it back to save memory without redoing that calculation.
+///
+/// The cost is explicit: smoltcp allocates both an RX and a TX buffer of this
+/// size per socket, so a connection costs ~272 KiB (2 × 128 KiB plus smoltcp
+/// bookkeeping). The idle listener pool is capped at [`MAX_IDLE_LISTENERS`], so
+/// its worst case is ~17 MiB, plus ~272 KiB per live connection — a deliberate
+/// trade of memory for the throughput goal on a phone.
+const TCP_BUFFER_SIZE: usize = 128 * 1024;
 
 /// Upper bound on the idle listening sockets the gateway keeps.
 ///
@@ -886,6 +899,46 @@ mod tests {
         assert!(g.poll(Instant::now()).is_empty());
         assert!(g.take_tx().is_empty());
         assert!(g.poll_delay(Instant::now()).is_none());
+    }
+
+    /// The per-connection window is the throughput ceiling. Pin the send
+    /// capacity at the current size so a future "save some memory" change has to
+    /// confront the goal (≥ 40 Mb/s, which needs a window of at least
+    /// `40 Mb/s × RTT`; 64 KiB already fails at a 20 ms RTT).
+    #[test]
+    fn the_tcp_send_window_is_at_least_64_kib() {
+        let mut g = Gateway::new(GW_ADDR, GW_PREFIX, MTU);
+        let client = client();
+        let dst = dst();
+
+        g.push_rx(syn(client, dst));
+        let events = g.poll(Instant::now());
+        let GatewayEvent::TcpAccepted { handle, .. } = events[0];
+        let synack = parse(&g.take_tx()[0]);
+        g.push_rx(tcp_packet(
+            client,
+            dst,
+            CLIENT_ISN + 1,
+            Some(synack.seq + 1),
+            ACK,
+            &[],
+            None,
+        ));
+        g.poll(Instant::now());
+        g.take_tx();
+
+        let payload = vec![0u8; TCP_BUFFER_SIZE];
+        let accepted = g
+            .tcp_send(handle, &payload)
+            .expect("a connected socket accepts data");
+        assert!(
+            accepted >= 64 * 1024,
+            "the window must stay large enough for the throughput goal"
+        );
+        assert_eq!(
+            accepted, TCP_BUFFER_SIZE,
+            "the whole advertised window is available in one write"
+        );
     }
 
     #[test]
