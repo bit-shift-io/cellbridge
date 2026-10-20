@@ -201,6 +201,37 @@ impl Gateway {
     pub fn tcp_close(&mut self, handle: SocketHandle) {
         self.sockets.get_mut::<tcp::Socket>(handle).close();
     }
+
+    /// Abort a connection socket, sending a reset to the client.
+    ///
+    /// Used to tear a splice down when the real socket fails: a graceful close
+    /// would look like a clean end-of-response, so the client must see a reset
+    /// instead.
+    pub fn tcp_abort(&mut self, handle: SocketHandle) {
+        self.sockets.get_mut::<tcp::Socket>(handle).abort();
+    }
+
+    /// Remove a connection socket from the stack, freeing its buffers.
+    ///
+    /// Intended to be called once a splice has finished with the socket (see
+    /// [`crate::TcpSpliceEngine::closed_handles`]); a connection socket holds
+    /// ~16 KiB, so leaving it in the set leaks the way R6 warns about.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handle` does not refer to a socket in the set, so each handle
+    /// must be removed exactly once.
+    pub fn tcp_remove(&mut self, handle: SocketHandle) {
+        self.sockets.remove(handle);
+    }
+
+    /// How many sockets the stack currently holds.
+    ///
+    /// Idle listeners, live connections and the ICMP socket all count. Used to
+    /// assert that finished connections do not accumulate.
+    pub fn socket_count(&self) -> usize {
+        self.sockets.iter().count()
+    }
 }
 
 /// The destination port of an IPv4 TCP packet carrying a bare SYN, if it is one.
