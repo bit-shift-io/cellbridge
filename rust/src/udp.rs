@@ -22,7 +22,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::stats::StatsCounters;
 
 /// An IPv4 header with no options.
 const IPV4_HEADER_LEN: usize = 20;
@@ -80,9 +83,11 @@ pub struct OutboundUdp {
 
 /// Bookkeeping for one tracked flow.
 struct Flow {
-    /// When this flow was last sent or received on, for idle expiry.
+    /// When this flow was last sent or received on, for idle expiry and for
+    /// choosing the flow to evict.
     last_seen: Instant,
-    /// Insertion sequence, for oldest-first eviction.
+    /// Insertion sequence, which breaks ties between two flows whose latest
+    /// activity landed on the same clock tick.
     seq: u64,
 }
 
@@ -91,9 +96,16 @@ struct Flow {
 /// The table is bounded in two independent ways:
 ///
 /// * `max_flows` is a hard cap. Inserting a new flow when the table is full
-///   evicts the **oldest inserted** flow, regardless of how recently it was
-///   active.
+///   evicts the **least recently active** flow, judged by the same
+///   [`Flow::last_seen`] that idle expiry uses.
 /// * [`Self::expire`] drops flows idle for at least `idle_timeout`.
+///
+/// Eviction is by activity rather than by insertion order because a flow that
+/// is still receiving (a QUIC connection downloading, say) would otherwise be
+/// the first to go: the table would stop tracking flows that are demonstrably
+/// alive, and the bridge's `active_flows` would under-report what is running.
+/// Ties fall back to insertion order, so a table whose flows are equally fresh
+/// still evicts the oldest guest.
 ///
 /// An evicted flow's replies can still be built by [`Self::handle_reply`]: the
 /// [`FlowId`] carries everything the reply needs, so table pressure cannot
@@ -102,14 +114,18 @@ pub struct UdpForwarder {
     max_flows: usize,
     idle_timeout: Duration,
     flows: HashMap<FlowId, Flow>,
-    /// Insertion sequence to flow, oldest first.
-    inserted: BTreeMap<u64, FlowId>,
+    /// Every tracked flow keyed by its latest activity, least recent first, so
+    /// the eviction victim is always the first entry.
+    by_activity: BTreeMap<(Instant, u64), FlowId>,
     next_seq: u64,
+    /// Payload byte counters shared with the rest of the bridge.
+    counters: Arc<StatsCounters>,
 }
 
 impl UdpForwarder {
-    /// Create a forwarder holding at most `max_flows` flows and expiring flows
-    /// that have been idle for `idle_timeout`.
+    /// Create a forwarder holding at most `max_flows` flows, expiring flows
+    /// that have been idle for `idle_timeout`, and counting its payload bytes
+    /// in private counters of its own.
     ///
     /// A `max_flows` of zero drops every packet.
     pub fn new(max_flows: usize, idle_timeout: Duration) -> UdpForwarder {
@@ -117,15 +133,32 @@ impl UdpForwarder {
             max_flows,
             idle_timeout,
             flows: HashMap::new(),
-            inserted: BTreeMap::new(),
+            by_activity: BTreeMap::new(),
             next_seq: 0,
+            counters: Arc::new(StatsCounters::new()),
+        }
+    }
+
+    /// Create a forwarder that records its payload bytes in `counters`.
+    ///
+    /// Used by the bridge so the UDP and TCP paths feed one shared
+    /// [`crate::StatsCounters`].
+    pub fn with_counters(
+        max_flows: usize,
+        idle_timeout: Duration,
+        counters: Arc<StatsCounters>,
+    ) -> UdpForwarder {
+        UdpForwarder {
+            counters,
+            ..UdpForwarder::new(max_flows, idle_timeout)
         }
     }
 
     /// Decode an inner IPv4/UDP packet and record its flow.
     ///
     /// Returns `None` for a malformed, fragmented or non-UDP packet, and when
-    /// the table has no capacity.
+    /// the table has no capacity. A payload that is forwarded is counted as
+    /// sent toward its real destination.
     pub fn handle_outbound(&mut self, ip_packet: &[u8]) -> Option<OutboundUdp> {
         let parsed = parse_udp(ip_packet)?;
         let flow = FlowId {
@@ -133,6 +166,7 @@ impl UdpForwarder {
             dst: parsed.dst,
         };
         self.track(flow, Instant::now())?;
+        self.counters.add_tx(parsed.payload.len());
         Some(OutboundUdp {
             flow,
             dst: parsed.dst,
@@ -144,13 +178,15 @@ impl UdpForwarder {
     ///
     /// The packet's source is the real destination and its destination is the
     /// client, so the client's source port is restored. A reply also refreshes
-    /// the flow's idle timer. An unknown or evicted flow still gets a reply —
-    /// the table is bookkeeping, not a gate on traffic.
+    /// the flow's activity and counts its payload as received. An unknown or
+    /// evicted flow still gets a reply — the table is bookkeeping, not a gate
+    /// on traffic.
     pub fn handle_reply(&mut self, flow: FlowId, payload: &[u8]) -> Vec<u8> {
-        if let Some(tracked) = self.flows.get_mut(&flow) {
-            tracked.last_seen = Instant::now();
+        let reply = self.build_reply(flow, payload);
+        if !reply.is_empty() {
+            self.counters.add_rx(payload.len());
         }
-        build_udp_reply(flow.dst, flow.client, payload)
+        reply
     }
 
     /// Build the reply for `payload` only if it fits within `mtu`.
@@ -162,14 +198,40 @@ impl UdpForwarder {
     /// Returns `None` for an over-MTU reply and for payloads that
     /// [`build_udp_reply`] cannot represent (IPv6 destinations or a length
     /// beyond the 16-bit IPv4 total length).
+    ///
+    /// Only a reply that is actually returned is counted as received: an
+    /// over-MTU datagram never reaches the client.
     pub fn handle_reply_within_mtu(
         &mut self,
         flow: FlowId,
         payload: &[u8],
         mtu: usize,
     ) -> Option<Vec<u8>> {
-        let reply = self.handle_reply(flow, payload);
-        (!reply.is_empty() && reply.len() <= mtu).then_some(reply)
+        let reply = self.build_reply(flow, payload);
+        if reply.is_empty() || reply.len() > mtu {
+            return None;
+        }
+        self.counters.add_rx(payload.len());
+        Some(reply)
+    }
+
+    /// Refresh `flow`'s activity and build its reply packet.
+    ///
+    /// An empty result means the payload cannot be represented as an IPv4
+    /// datagram at all; the public wrappers drop it, and neither counts it.
+    fn build_reply(&mut self, flow: FlowId, payload: &[u8]) -> Vec<u8> {
+        self.touch(&flow, Instant::now());
+        build_udp_reply(flow.dst, flow.client, payload)
+    }
+
+    /// Forget every tracked flow at once, for example when the tunnel is lost.
+    ///
+    /// The forwarder owns no sockets, so the returned [`FlowId`]s are what the
+    /// caller — which does own the outbound sockets — needs in order to close
+    /// them. A flow that keeps sending afterwards is simply tracked again.
+    pub fn tear_down_all(&mut self) -> Vec<FlowId> {
+        self.by_activity.clear();
+        std::mem::take(&mut self.flows).into_keys().collect()
     }
 
     /// Remove flows that have been idle for at least the configured timeout.
@@ -177,11 +239,12 @@ impl UdpForwarder {
     /// `now` is expected to come from the same clock as the `Instant::now()`
     /// calls that timestamp traffic.
     pub fn expire(&mut self, now: Instant) {
-        let inserted = &mut self.inserted;
+        let by_activity = &mut self.by_activity;
+        let idle_timeout = self.idle_timeout;
         self.flows.retain(|_, flow| {
             let idle = now.saturating_duration_since(flow.last_seen);
-            if idle >= self.idle_timeout {
-                inserted.remove(&flow.seq);
+            if idle >= idle_timeout {
+                by_activity.remove(&(flow.last_seen, flow.seq));
                 false
             } else {
                 true
@@ -203,15 +266,15 @@ impl UdpForwarder {
     ///
     /// Returns `None` only when the table has zero capacity.
     fn track(&mut self, flow: FlowId, now: Instant) -> Option<()> {
-        if let Some(existing) = self.flows.get_mut(&flow) {
-            existing.last_seen = now;
+        if self.flows.contains_key(&flow) {
+            self.touch(&flow, now);
             return Some(());
         }
         if self.max_flows == 0 {
             return None;
         }
         while self.flows.len() >= self.max_flows {
-            if !self.evict_oldest() {
+            if !self.evict_least_recent() {
                 break;
             }
         }
@@ -225,23 +288,41 @@ impl UdpForwarder {
                 seq,
             },
         );
-        self.inserted.insert(seq, flow);
+        self.by_activity.insert((now, seq), flow);
         Some(())
     }
 
-    /// Drop the oldest inserted flow, returning whether one was removed.
-    fn evict_oldest(&mut self) -> bool {
-        while let Some((seq, flow)) = self.inserted.pop_first() {
-            match self.flows.get(&flow) {
-                Some(tracked) if tracked.seq == seq => {
-                    self.flows.remove(&flow);
-                    return true;
-                }
-                // A stale ordering entry left by an earlier removal.
-                _ => continue,
-            }
+    /// Record that `flow` was just active, keeping the eviction order in step.
+    fn touch(&mut self, flow: &FlowId, now: Instant) {
+        if let Some(tracked) = self.flows.get_mut(flow) {
+            let previous = (tracked.last_seen, tracked.seq);
+            tracked.last_seen = now;
+            self.by_activity.remove(&previous);
+            self.by_activity.insert((now, tracked.seq), *flow);
         }
-        false
+    }
+
+    /// Backdate `flow`'s last activity, keeping the eviction order in step.
+    ///
+    /// Test-only: activity only ever moves forwards on the data path.
+    #[cfg(test)]
+    fn backdate(&mut self, flow: &FlowId, at: Instant) {
+        self.touch(flow, at);
+    }
+
+    /// Drop the flow with the oldest activity, returning whether one went.
+    fn evict_least_recent(&mut self) -> bool {
+        let Some((activity, flow)) = self.by_activity.pop_first() else {
+            return false;
+        };
+        let evicted = self.flows.remove(&flow);
+        debug_assert!(
+            evicted
+                .as_ref()
+                .is_some_and(|tracked| (tracked.last_seen, tracked.seq) == activity),
+            "the activity index must name a live flow at its recorded activity"
+        );
+        evicted.is_some()
     }
 }
 
@@ -773,7 +854,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn eviction_evicts_by_insertion_order_not_recent_activity() {
+    fn eviction_drops_the_least_recently_active_flow() {
         let mut f = UdpForwarder::new(2, Duration::from_secs(30));
         let a = f
             .handle_outbound(&client_packet(53001, dst(), b"a"))
@@ -782,7 +863,8 @@ mod tests {
             .handle_outbound(&client_packet(53002, dst(), b"b"))
             .unwrap();
 
-        // A is the most recently active flow, but it was inserted first.
+        // A is refreshed by a reply and by a further outbound packet, so B is
+        // now the least recently active flow in the table.
         f.handle_reply(a.flow, b"reply");
         f.handle_outbound(&client_packet(53001, dst(), b"a again"));
 
@@ -790,10 +872,13 @@ mod tests {
 
         assert_eq!(f.len(), 2);
         assert!(
-            !f.flows.contains_key(&a.flow),
-            "the oldest insertion is evicted even though it was recently active"
+            f.flows.contains_key(&a.flow),
+            "a flow that is still moving traffic must not be evicted"
         );
-        assert!(f.flows.contains_key(&b.flow));
+        assert!(
+            !f.flows.contains_key(&b.flow),
+            "the least recently active flow is the one evicted"
+        );
     }
 
     #[test]
@@ -841,7 +926,7 @@ mod tests {
         assert_eq!(f.len(), 2, "a just-created flow is not idle");
 
         let now = Instant::now();
-        f.flows.get_mut(&idle.flow).unwrap().last_seen = now - Duration::from_secs(31);
+        f.backdate(&idle.flow, now - Duration::from_secs(31));
         f.expire(now);
 
         assert_eq!(f.len(), 1);
@@ -862,7 +947,7 @@ mod tests {
 
         // Pretend the flow has already been idle for a while; the reply should
         // refresh it, just as an outbound packet would.
-        f.flows.get_mut(&flow).unwrap().last_seen = Instant::now() - Duration::from_secs(20);
+        f.backdate(&flow, Instant::now() - Duration::from_secs(20));
         let _ = f.handle_reply(flow, b"reply");
 
         f.expire(Instant::now() + Duration::from_secs(20));
@@ -877,7 +962,7 @@ mod tests {
             .unwrap()
             .flow;
 
-        f.flows.get_mut(&flow).unwrap().last_seen = Instant::now() - Duration::from_secs(20);
+        f.backdate(&flow, Instant::now() - Duration::from_secs(20));
         f.handle_outbound(&client_packet(53000, dst(), b"a again"));
 
         f.expire(Instant::now() + Duration::from_secs(20));
@@ -910,5 +995,79 @@ mod tests {
         let parsed = parse_udp(&reply).expect("the reply is still built");
         assert_eq!(parsed.dst, first.flow.client);
         assert_eq!(parsed.payload, b"late");
+    }
+
+    // ------------------------------------------------------------------
+    // Payload accounting and teardown.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn payload_bytes_are_counted_in_both_directions() {
+        let counters = Arc::new(StatsCounters::new());
+        let mut f = UdpForwarder::with_counters(8, Duration::from_secs(30), Arc::clone(&counters));
+
+        let out = f
+            .handle_outbound(&client_packet(53000, dst(), b"ping"))
+            .expect("a valid packet is forwarded");
+        let _ = f.handle_reply(out.flow, b"pong");
+
+        let stats = counters.snapshot(f.len());
+        assert_eq!(stats.tx_bytes, 4, "the outbound payload is counted once");
+        assert_eq!(stats.rx_bytes, 4, "the reply payload is counted once");
+        assert_eq!(stats.active_flows, 1, "the flow is live");
+    }
+
+    #[test]
+    fn a_reply_that_never_crosses_the_tunnel_is_not_counted_as_received() {
+        let counters = Arc::new(StatsCounters::new());
+        let mut f = UdpForwarder::with_counters(8, Duration::from_secs(30), Arc::clone(&counters));
+        let flow = f
+            .handle_outbound(&client_packet(53000, dst(), b"q"))
+            .unwrap()
+            .flow;
+
+        // Over the tunnel MTU: dropped before it reaches the client.
+        assert!(f.handle_reply_within_mtu(flow, &[0xab; 64], 64).is_none());
+        // And one that cannot be represented as an IPv4 datagram at all.
+        assert!(
+            f.handle_reply_within_mtu(flow, &vec![0u8; 65508], 65535)
+                .is_none()
+        );
+
+        let stats = counters.snapshot(f.len());
+        assert_eq!(stats.rx_bytes, 0, "an undeliverable reply moves no bytes");
+        assert_eq!(stats.tx_bytes, 1, "the request that did go out is counted");
+    }
+
+    #[test]
+    fn tearing_down_all_flows_empties_the_table() {
+        let mut f = UdpForwarder::new(8, Duration::from_secs(30));
+        let a = f
+            .handle_outbound(&client_packet(53001, dst(), b"a"))
+            .unwrap()
+            .flow;
+        let b = f
+            .handle_outbound(&client_packet(53002, dst(), b"b"))
+            .unwrap()
+            .flow;
+
+        // The caller owns the outbound sockets, so it is handed every flow it
+        // has to close.
+        let torn = f.tear_down_all();
+        assert_eq!(torn.len(), 2);
+        assert!(torn.contains(&a) && torn.contains(&b));
+        assert!(f.is_empty(), "no flow survives the teardown");
+        assert!(
+            f.tear_down_all().is_empty(),
+            "tearing down an empty table is harmless"
+        );
+
+        // A flow that starts afterwards is tracked cleanly, with no stale
+        // bookkeeping left behind.
+        let again = f
+            .handle_outbound(&client_packet(53001, dst(), b"a"))
+            .unwrap();
+        assert_eq!(again.flow, a);
+        assert_eq!(f.len(), 1);
     }
 }

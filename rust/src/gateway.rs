@@ -20,6 +20,15 @@ use crate::device::QueueDevice;
 /// Receive/transmit buffer size for each TCP socket.
 const TCP_BUFFER_SIZE: usize = 8192;
 
+/// Upper bound on the idle listening sockets the gateway keeps.
+///
+/// smoltcp needs one listening socket per destination port, and a socket holds
+/// ~16 KiB of buffers, so the pool has to be bounded: past this many idle
+/// listeners the least recently used one is closed to make room for the port
+/// that needs it. Nothing is lost by reaping — a listener is recreated on
+/// demand, so the only cost is the buffers.
+const MAX_IDLE_LISTENERS: usize = 64;
+
 /// The IPv4 protocol number for UDP.
 const UDP_PROTOCOL: u8 = 17;
 
@@ -56,15 +65,31 @@ pub enum GatewayEvent {
 /// keeps one idle listening socket per destination port it has seen a SYN for.
 /// When one accepts, it becomes the connection and a fresh listener is created
 /// the next time a SYN for that port arrives.
+///
+/// The idle pool is bounded: once it holds [`MAX_IDLE_LISTENERS`] listeners,
+/// creating one for a new port first closes the least recently used one, so a
+/// stream of SYNs to fresh ports — a scan, or a SYN the stack drops — cannot
+/// grow the socket set without bound.
 pub struct Gateway {
     device: QueueDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    /// Idle listening sockets not yet connected, with the port they listen on.
-    listeners: Vec<(u16, SocketHandle)>,
+    /// Idle listening sockets not yet connected.
+    listeners: Vec<Listener>,
     /// Destination ports of pure SYNs seen since the last poll, so a listener
     /// is available for each of them before the stack runs.
     pending_syns: Vec<u16>,
+}
+
+/// One idle listening socket, and when it last absorbed a SYN.
+struct Listener {
+    /// The destination port it listens on.
+    port: u16,
+    /// The smoltcp socket, created in the `Listen` state.
+    handle: SocketHandle,
+    /// When this listener last absorbed a SYN, for reaping the least recently
+    /// used one once the pool is full.
+    last_used: Instant,
 }
 
 impl Gateway {
@@ -141,33 +166,56 @@ impl Gateway {
 
     /// Advance the stack and report newly accepted TCP connections.
     pub fn poll(&mut self, now: Instant) -> Vec<GatewayEvent> {
-        self.open_pending_listeners();
+        self.open_pending_listeners(now);
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.drain_accepts()
     }
 
     /// Make sure every pending SYN has an idle listener to match against.
-    fn open_pending_listeners(&mut self) {
+    fn open_pending_listeners(&mut self, now: Instant) {
         if self.pending_syns.is_empty() {
             return;
         }
 
+        let pending = mem::take(&mut self.pending_syns);
         let mut idle: HashMap<u16, usize> = HashMap::new();
-        for (port, _) in &self.listeners {
-            *idle.entry(*port).or_insert(0) += 1;
+        for listener in &self.listeners {
+            *idle.entry(listener.port).or_insert(0) += 1;
         }
 
-        for port in mem::take(&mut self.pending_syns) {
-            match idle.get_mut(&port) {
+        for port in &pending {
+            match idle.get_mut(port) {
                 // An idle listener will absorb this SYN; consume it.
-                Some(remaining) if *remaining > 0 => *remaining -= 1,
-                _ => self.add_listener(port),
+                Some(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                    self.note_listener_used(*port, now);
+                }
+                _ => self.add_listener(*port, &pending, now),
             }
         }
     }
 
+    /// Record that the listener for `port` is about to absorb a SYN.
+    ///
+    /// The least recently used matching listener is the one kept: several
+    /// listeners can share a port when a batch carries more SYNs for it than
+    /// there were idle sockets, and refreshing any of them is enough to keep
+    /// the reaping honest.
+    fn note_listener_used(&mut self, port: u16, now: Instant) {
+        let used = self
+            .listeners
+            .iter_mut()
+            .filter(|listener| listener.port == port)
+            .min_by_key(|listener| listener.last_used);
+        if let Some(listener) = used {
+            listener.last_used = now;
+        }
+    }
+
     /// Add a fresh socket listening on `port` and record it as idle.
-    fn add_listener(&mut self, port: u16) {
+    fn add_listener(&mut self, port: u16, pending: &[u16], now: Instant) {
+        self.reap_idle_listener(pending);
+
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]),
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]),
@@ -176,7 +224,34 @@ impl Gateway {
             .listen(port)
             .expect("a fresh socket accepts a nonzero listen port");
         let handle = self.sockets.add(socket);
-        self.listeners.push((port, handle));
+        self.listeners.push(Listener {
+            port,
+            handle,
+            last_used: now,
+        });
+    }
+
+    /// Close the least recently used idle listener, if the pool is at its cap.
+    ///
+    /// A listener whose port is in `pending` is spared: a SYN for it is already
+    /// queued for the stack, and reaping its listener would drop that SYN. If
+    /// every idle listener is spoken for, the pool is allowed to sit above the
+    /// cap for this batch rather than break a connection.
+    fn reap_idle_listener(&mut self, pending: &[u16]) {
+        if self.listeners.len() < MAX_IDLE_LISTENERS {
+            return;
+        }
+        let victim = self
+            .listeners
+            .iter()
+            .enumerate()
+            .filter(|(_, listener)| !pending.contains(&listener.port))
+            .min_by_key(|(_, listener)| listener.last_used)
+            .map(|(index, _)| index);
+        if let Some(index) = victim {
+            let listener = self.listeners.remove(index);
+            self.sockets.remove(listener.handle);
+        }
     }
 
     /// Turn listeners that have moved out of the Listen state into events,
@@ -185,9 +260,18 @@ impl Gateway {
         let mut events = Vec::new();
         let mut idle = Vec::new();
 
-        for (port, handle) in mem::take(&mut self.listeners) {
+        for listener in mem::take(&mut self.listeners) {
+            let Listener {
+                port,
+                handle,
+                last_used,
+            } = listener;
             match self.sockets.get::<tcp::Socket>(handle).state() {
-                tcp::State::Listen => idle.push((port, handle)),
+                tcp::State::Listen => idle.push(Listener {
+                    port,
+                    handle,
+                    last_used,
+                }),
                 tcp::State::Closed => {
                     self.sockets.remove(handle);
                 }
@@ -287,6 +371,15 @@ impl Gateway {
     /// assert that finished connections do not accumulate.
     pub fn socket_count(&self) -> usize {
         self.sockets.iter().count()
+    }
+
+    /// How many idle listening sockets the pool holds.
+    ///
+    /// Listeners are created on demand per destination port and reaped once the
+    /// pool reaches [`MAX_IDLE_LISTENERS`], so this stays bounded however many
+    /// ports are scanned.
+    pub fn listener_count(&self) -> usize {
+        self.listeners.len()
     }
 }
 
@@ -606,6 +699,105 @@ mod tests {
         g.push_rx(tcp_packet(client(), dst(), 1, Some(1), ACK, &[], None));
 
         assert!(g.poll(Instant::now()).is_empty(), "nothing is accepted");
+    }
+
+    #[test]
+    fn idle_listeners_do_not_grow_without_bound() {
+        // Every destination port needs its own smoltcp listening socket, and
+        // each one holds ~16 KiB. A listener is created for any bare SYN the
+        // gateway sees — including one the stack then drops, here because the
+        // TCP checksum is wrong — so without reaping it would sit in the socket
+        // set forever. A port scan is the cheap way to grow that set without
+        // bound.
+        let mut g = Gateway::new(GW_ADDR, GW_PREFIX, MTU);
+        let baseline = g.socket_count();
+
+        const PORTS: u16 = 300;
+        for i in 0..PORTS {
+            let dst: SocketAddr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1024 + i);
+            let client: SocketAddr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 1)), 40000 + i);
+            let mut pkt = syn(client, dst);
+            // Break the TCP checksum: smoltcp drops the packet, so the listener
+            // created for it is never accepted and never becomes a connection.
+            pkt[37] ^= 0xff;
+            g.push_rx(pkt);
+            assert!(
+                g.poll(Instant::now()).is_empty(),
+                "a corrupt SYN is not accepted"
+            );
+            g.take_tx();
+        }
+
+        assert!(
+            g.listener_count() <= MAX_IDLE_LISTENERS,
+            "the idle pool is bounded: {} listeners after {PORTS} ports",
+            g.listener_count()
+        );
+        assert!(
+            g.socket_count() <= baseline + MAX_IDLE_LISTENERS,
+            "no socket beyond the listener pool is left behind: {} after {PORTS} ports",
+            g.socket_count()
+        );
+    }
+
+    /// A SYN whose listener was reaped must still be accepted once it is made
+    /// again: reaping costs a socket, never reachability.
+    #[test]
+    fn a_reaped_listener_still_accepts_a_later_syn() {
+        let mut g = Gateway::new(GW_ADDR, GW_PREFIX, MTU);
+        let first: SocketAddr = "1.1.1.1:1234".parse().unwrap();
+
+        // A SYN the stack drops leaves an idle listener for `first`, the oldest
+        // in the pool.
+        let mut dropped = syn(client(), first);
+        dropped[37] ^= 0xff;
+        g.push_rx(dropped);
+        g.poll(Instant::now());
+        g.take_tx();
+
+        // Fill the pool with other ports, which reaps `first`'s listener.
+        for i in 0..MAX_IDLE_LISTENERS as u16 {
+            let dst: SocketAddr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 2000 + i);
+            let mut pkt = syn(client(), dst);
+            pkt[37] ^= 0xff;
+            g.push_rx(pkt);
+            g.poll(Instant::now());
+            g.take_tx();
+        }
+        assert_eq!(g.listener_count(), MAX_IDLE_LISTENERS, "the pool is full");
+        assert!(
+            g.socket_count() == MAX_IDLE_LISTENERS + 1,
+            "the reaped listener's socket is freed (one is the ICMP socket)"
+        );
+
+        // The port whose listener was reaped is still reachable.
+        g.push_rx(syn(client(), first));
+        let events = g.poll(Instant::now());
+        assert_eq!(events.len(), 1, "the recreated listener accepts the SYN");
+        assert_eq!(expect_tcp_accepted(&events[0]).1, first);
+    }
+
+    /// A burst of SYNs to more distinct ports than the pool holds must still
+    /// yield a connection for each of them.
+    #[test]
+    fn a_batch_of_syns_larger_than_the_pool_is_still_served() {
+        let mut g = Gateway::new(GW_ADDR, GW_PREFIX, MTU);
+        let ports = MAX_IDLE_LISTENERS + 8;
+
+        for i in 0..ports as u16 {
+            let dst: SocketAddr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), 3000 + i);
+            g.push_rx(syn(client(), dst));
+        }
+        let events = g.poll(Instant::now());
+        assert_eq!(
+            events.len(),
+            ports,
+            "reaping never takes a listener whose SYN is already queued"
+        );
     }
 
     #[test]

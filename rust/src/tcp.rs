@@ -23,12 +23,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::{self, RecvError};
 
 use crate::gateway::Gateway;
+use crate::stats::StatsCounters;
 
 /// Scratch size for a single move between the two halves.
 ///
@@ -116,12 +118,49 @@ pub struct TcpSpliceEngine {
     flows: HashMap<SocketHandle, Flow>,
     /// Handles whose splice has ended, drained by [`Self::closed_handles`].
     finished: RefCell<Vec<SocketHandle>>,
+    /// Payload byte counters shared with the rest of the bridge.
+    counters: Arc<StatsCounters>,
 }
 
 impl TcpSpliceEngine {
-    /// Create an engine with no splices.
+    /// Create an engine with no splices and its own private counters.
     pub fn new() -> Self {
         TcpSpliceEngine::default()
+    }
+
+    /// Create an engine that records its payload bytes in `counters`.
+    ///
+    /// Used by the bridge so the TCP and UDP paths feed one shared
+    /// [`crate::StatsCounters`].
+    pub fn with_counters(counters: Arc<StatsCounters>) -> Self {
+        TcpSpliceEngine {
+            counters,
+            ..TcpSpliceEngine::default()
+        }
+    }
+
+    /// How many splices are currently live.
+    pub fn flow_count(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// Tear down every live splice at once, for example when the tunnel is lost.
+    ///
+    /// Every client-facing socket is reset — a graceful close would look like a
+    /// clean end of response, leaving a client waiting on a half-open connection
+    /// — and every real socket is shut down and dropped. All handles are
+    /// recorded as closed (so [`Self::closed_handles`] reports every one) and
+    /// returned as [`IoOp::Reset`] for the caller to apply.
+    pub fn tear_down_all(&mut self) -> Vec<IoOp> {
+        let mut ops = Vec::with_capacity(self.flows.len());
+        for (handle, flow) in self.flows.drain() {
+            if let Some(stream) = flow.peer.as_ref() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            ops.push(IoOp::Reset { handle });
+            self.finished.borrow_mut().push(handle);
+        }
+        ops
     }
 
     /// Begin splicing the accepted connection `handle`.
@@ -247,7 +286,10 @@ impl TcpSpliceEngine {
                     Self::maybe_close(flow, handle, ops);
                     return;
                 }
-                Some(Ok(n)) => flow.to_client.extend_from_slice(&buf[..n]),
+                Some(Ok(n)) => {
+                    self.counters.add_rx(n);
+                    flow.to_client.extend_from_slice(&buf[..n]);
+                }
                 Some(Err(err)) if err.kind() == ErrorKind::WouldBlock => return,
                 Some(Err(_)) | None => {
                     Self::tear_down(flow, handle, ops);
@@ -273,7 +315,10 @@ impl TcpSpliceEngine {
         let read = flow.peer.as_mut().map(|stream| stream.read(&mut buf));
         match read {
             Some(Ok(0)) => flow.peer_eof = true,
-            Some(Ok(n)) => flow.to_client.extend_from_slice(&buf[..n]),
+            Some(Ok(n)) => {
+                self.counters.add_rx(n);
+                flow.to_client.extend_from_slice(&buf[..n]);
+            }
             Some(Err(err)) if err.kind() == ErrorKind::WouldBlock => {}
             Some(Err(_)) | None => {
                 Self::tear_down(flow, handle, ops);
@@ -327,7 +372,10 @@ impl TcpSpliceEngine {
 
             match gw.tcp_recv(handle, &mut buf) {
                 Ok(0) => return,
-                Ok(n) => flow.to_peer.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    self.counters.add_tx(n);
+                    flow.to_peer.extend_from_slice(&buf[..n]);
+                }
                 Err(RecvError::Finished) => {
                     if let Some(stream) = flow.peer.as_ref() {
                         let _ = stream.shutdown(Shutdown::Write);
