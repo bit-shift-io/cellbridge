@@ -1,9 +1,9 @@
 //! The TCP splice engine.
 //!
 //! The [`Gateway`] terminates the LAN client's TCP connection in smoltcp. This
-//! module completes the path: on accept it dials the destination the client
-//! asked for with an ordinary, non-blocking [`TcpStream`], then copies bytes
-//! between that real socket and the smoltcp connection.
+//! module completes the path: on accept it starts dialling the destination the
+//! client asked for with an ordinary TCP socket, then copies bytes between that
+//! real socket and the smoltcp connection.
 //!
 //! The engine owns the real sockets. A caller drives it from its poll loop:
 //!
@@ -13,13 +13,17 @@
 //! 3. the caller applies those ops (`Gateway::tcp_send` / `Gateway::tcp_close`)
 //!    and polls again so they reach the wire.
 //!
-//! A splice whose destination could not be dialled, or whose real socket fails,
-//! is torn down by resetting the client-facing socket rather than left hanging.
+//! Nothing on the poll path blocks: the dial runs asynchronously and is only
+//! consulted (never waited on), so a destination that never answers cannot stall
+//! other flows or the tunnel loop. A splice whose destination could not be
+//! dialled, or whose real socket fails, is torn down by resetting the
+//! client-facing socket rather than left hanging.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::RecvError;
@@ -63,14 +67,47 @@ pub enum IoOp {
 
 /// One in-flight splice: the client-facing smoltcp socket and the real socket.
 struct Flow {
-    /// The real socket to the destination, or `None` when the dial failed.
+    /// The real socket to the destination, once the dial has completed.
     peer: Option<TcpStream>,
+    /// The background dial, while it is still in flight.
+    dialing: Option<Receiver<std::io::Result<TcpStream>>>,
     /// Bytes dequeued from smoltcp that the peer socket has not accepted yet.
     pending: Vec<u8>,
     /// The client's write half closed; the peer socket was told with a FIN.
     client_closed: bool,
     /// The peer's read half ended: EOF, a read error, or a failed dial.
     peer_closed: bool,
+}
+
+/// The outcome of consulting a flow's dial during a poll step.
+enum Dial {
+    /// The real socket is connected and ready.
+    Ready,
+    /// The dial is still in flight.
+    Pending,
+    /// The dial failed (or the flow is gone); the client must be reset.
+    Failed,
+}
+
+impl Flow {
+    /// Advance this flow's dial without ever waiting on it.
+    fn advance_dial(&mut self) -> Dial {
+        if self.peer.is_some() {
+            return Dial::Ready;
+        }
+        match self.dialing.as_mut().map(|rx| rx.try_recv()) {
+            Some(Ok(Ok(stream))) => {
+                self.peer = Some(stream);
+                self.dialing = None;
+                Dial::Ready
+            }
+            // An error from `try_recv` (sender gone) or from the dial itself.
+            Some(Ok(Err(_))) | Some(Err(TryRecvError::Disconnected)) => Dial::Failed,
+            Some(Err(TryRecvError::Empty)) => Dial::Pending,
+            // No peer and no dial: the flow was created broken.
+            None => Dial::Failed,
+        }
+    }
 }
 
 /// Splices smoltcp TCP connections to real, cellular-bound sockets.
@@ -91,18 +128,25 @@ impl TcpSpliceEngine {
     ///
     /// `_client` is the router's masqueraded source and is not needed: the real
     /// socket is dialled to `dst`, the destination the client asked for. The
-    /// dial is synchronous (std has no non-blocking `connect`); the socket is
-    /// put into non-blocking mode for all subsequent reads and writes. A dial
-    /// that fails is still recorded, so the next [`Self::pump`] resets the
-    /// client-facing socket instead of leaving it hanging.
+    /// dial runs asynchronously — this returns immediately, so an unreachable
+    /// destination cannot stall the poll loop — and the result is picked up by
+    /// the next [`Self::pump`] or [`Self::on_readable`]. A failed dial resets
+    /// the client-facing socket instead of leaving it hanging.
+    ///
+    /// Must be called from within a `tokio` runtime: the dial is a spawned task.
     pub fn on_accept(&mut self, handle: SocketHandle, _client: SocketAddr, dst: SocketAddr) {
-        let peer = TcpStream::connect(dst)
-            .ok()
-            .and_then(|stream| stream.set_nonblocking(true).ok().map(|()| stream));
+        let (tx, rx) = mpsc::channel();
+        tokio::spawn(async move {
+            let result = tokio::net::TcpStream::connect(dst)
+                .await
+                .and_then(tokio::net::TcpStream::into_std);
+            let _ = tx.send(result);
+        });
         self.flows.insert(
             handle,
             Flow {
-                peer,
+                peer: None,
+                dialing: Some(rx),
                 pending: Vec::new(),
                 client_closed: false,
                 peer_closed: false,
@@ -114,19 +158,21 @@ impl TcpSpliceEngine {
     pub fn pump(&mut self, gw: &mut Gateway) -> Vec<IoOp> {
         let mut ops = Vec::new();
         for handle in self.flows.keys().copied().collect::<Vec<_>>() {
-            // A splice whose dial failed resets the client immediately.
-            if self
-                .flows
-                .get(&handle)
-                .is_some_and(|flow| flow.peer.is_none())
-            {
-                self.flows.remove(&handle);
-                self.finished.borrow_mut().push(handle);
-                ops.push(IoOp::Reset { handle });
-                continue;
+            match self.flows.get_mut(&handle).map(Flow::advance_dial) {
+                // Never wait on a dial: keep serving the other flows.
+                Some(Dial::Pending) | None => {}
+                Some(Dial::Failed) => {
+                    if let Some(flow) = self.flows.get_mut(&handle) {
+                        Self::tear_down(flow, handle, &mut ops);
+                    }
+                    self.reap(handle);
+                }
+                Some(Dial::Ready) => {
+                    self.drain_from_client(gw, handle, &mut ops);
+                    self.read_from_peer(handle, &mut ops);
+                    self.reap(handle);
+                }
             }
-            self.drain_from_client(gw, handle, &mut ops);
-            ops.extend(self.on_readable(handle));
         }
         ops
     }
@@ -137,6 +183,21 @@ impl TcpSpliceEngine {
     /// socket becomes readable and apply the returned [`IoOp`]s to the gateway.
     pub fn on_readable(&mut self, handle: SocketHandle) -> Vec<IoOp> {
         let mut ops = Vec::new();
+        match self.flows.get_mut(&handle).map(Flow::advance_dial) {
+            Some(Dial::Ready) => self.read_from_peer(handle, &mut ops),
+            Some(Dial::Failed) => {
+                if let Some(flow) = self.flows.get_mut(&handle) {
+                    Self::tear_down(flow, handle, &mut ops);
+                }
+            }
+            Some(Dial::Pending) | None => {}
+        }
+        self.reap(handle);
+        ops
+    }
+
+    /// Copy whatever the peer socket has ready into the client-facing half.
+    fn read_from_peer(&mut self, handle: SocketHandle, ops: &mut Vec<IoOp>) {
         if let Some(flow) = self.flows.get_mut(&handle)
             && !flow.peer_closed
         {
@@ -152,11 +213,9 @@ impl TcpSpliceEngine {
                     data: buf[..n].to_vec(),
                 }),
                 Some(Err(err)) if err.kind() == ErrorKind::WouldBlock => {}
-                Some(Err(_)) | None => Self::tear_down(flow, handle, &mut ops),
+                Some(Err(_)) | None => Self::tear_down(flow, handle, ops),
             }
         }
-        self.reap(handle);
-        ops
     }
 
     /// Copy everything the client has sent into the real peer socket.
@@ -595,7 +654,15 @@ mod tests {
         let mut engine = TcpSpliceEngine::new();
         engine.on_accept(handle, client, dead);
 
-        let ops = engine.pump(&mut gw);
+        // The dial runs on a spawned task, so wait for it to report back.
+        let mut ops = Vec::new();
+        for _ in 0..1000 {
+            ops = engine.pump(&mut gw);
+            if !ops.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert_eq!(
             ops,
             vec![IoOp::Reset { handle }],
@@ -612,8 +679,21 @@ mod tests {
 
         let mut gw = Gateway::new(GW_ADDR, GW_PREFIX, MTU);
         let mut engine = TcpSpliceEngine::new();
-        let (handle, server_seq, client_seq) = handshake(&mut gw, client, dst);
+        let (handle, server_seq, mut client_seq) = handshake(&mut gw, client, dst);
         engine.on_accept(handle, client, dst);
+
+        // Complete a round-trip first, which also proves the dial finished.
+        gw.push_rx(tcp_packet(
+            client,
+            dst,
+            client_seq,
+            Some(server_seq),
+            PSH | ACK,
+            b"hi",
+        ));
+        client_seq += 2;
+        let echoed = drive_until(&mut gw, &mut engine, client, b"hi").await;
+        assert_eq!(&echoed, b"hi");
 
         // The client resets the connection; the splice must tear both ends
         // down rather than keep copying into a socket the stack has dropped.
@@ -633,5 +713,63 @@ mod tests {
             "a client reset resets the real socket and closes the splice"
         );
         assert_eq!(engine.closed_handles(), vec![handle]);
+    }
+
+    /// R7: a dial that never completes must not block the poll path or any
+    /// other flow.
+    #[tokio::test]
+    async fn a_pending_dial_does_not_block_other_flows() {
+        let (echo_dst, _server) = echo_server().await;
+        // A reserved TEST-NET-1 address on a non-standard port: nothing answers,
+        // so the SYN is blackholed and the dial stays in flight.
+        let blackhole: SocketAddr = "192.0.2.1:9".parse().unwrap();
+
+        let mut gw = Gateway::new(GW_ADDR, GW_PREFIX, MTU);
+        let mut engine = TcpSpliceEngine::new();
+
+        // Connection A dials the blackhole and is left pending.
+        let client_a: SocketAddr = "10.10.10.1:53010".parse().unwrap();
+        let (handle_a, ..) = handshake(&mut gw, client_a, blackhole);
+        let accepted = std::time::Instant::now();
+        engine.on_accept(handle_a, client_a, blackhole);
+        assert!(
+            accepted.elapsed() < Duration::from_millis(100),
+            "on_accept must return without waiting for the dial"
+        );
+
+        // Connection B reaches the local echo server and must complete normally
+        // while A's dial is still in flight.
+        let client_b: SocketAddr = "10.10.10.1:53011".parse().unwrap();
+        let (handle_b, server_seq_b, client_seq_b) = handshake(&mut gw, client_b, echo_dst);
+        engine.on_accept(handle_b, client_b, echo_dst);
+        gw.push_rx(tcp_packet(
+            client_b,
+            echo_dst,
+            client_seq_b,
+            Some(server_seq_b),
+            PSH | ACK,
+            b"ping",
+        ));
+        let echoed = drive_until(&mut gw, &mut engine, client_b, b"ping").await;
+        assert_eq!(
+            &echoed, b"ping",
+            "the second flow is unaffected by the pending dial"
+        );
+
+        // A was never waited on, reset, or closed: it is simply still dialling.
+        let ops = engine.pump(&mut gw);
+        let touches_a = ops.iter().any(|op| {
+            let handle = match op {
+                IoOp::Send { handle, .. } | IoOp::Close { handle } | IoOp::Reset { handle } => {
+                    *handle
+                }
+            };
+            handle == handle_a
+        });
+        assert!(!touches_a, "the pending dial must produce no work");
+        assert!(
+            !engine.closed_handles().contains(&handle_a),
+            "the pending dial must not be torn down"
+        );
     }
 }
