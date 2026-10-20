@@ -32,24 +32,19 @@ use crate::gateway::Gateway;
 
 /// Scratch size for a single move between the two halves.
 ///
-/// Also caps how much one splice step offers, so a single returned
-/// [`IoOp::Send`] always fits in a connection's 8 KiB smoltcp transmit buffer.
+/// Also bounds the peer-to-client tail: the engine reads at most this much into
+/// `to_client` before delivering it, so a stalled client's overflow is held in
+/// the engine rather than in an unbounded buffer.
 const CHUNK: usize = 4096;
 
 /// Work a splice needs the caller to apply to the [`Gateway`].
 ///
-/// The engine owns the real sockets, but the smoltcp side lives in the
-/// [`Gateway`] — and [`TcpSpliceEngine::on_readable`] is not handed one — so
-/// peer-to-client bytes, closes and resets come back for the caller to apply.
+/// The engine owns the real sockets and does its own send/receive accounting
+/// (so peer bytes are never lost); what it cannot do itself is put the smoltcp
+/// side into its terminal state, so closes and resets come back for the caller
+/// to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IoOp {
-    /// Queue `data` on the smoltcp connection: `Gateway::tcp_send`.
-    Send {
-        /// The smoltcp connection socket.
-        handle: SocketHandle,
-        /// Bytes read from the real peer socket.
-        data: Vec<u8>,
-    },
     /// Gracefully close the smoltcp connection: `Gateway::tcp_close`.
     Close {
         /// The smoltcp connection socket.
@@ -71,11 +66,16 @@ struct Flow {
     peer: Option<TcpStream>,
     /// The background dial, while it is still in flight.
     dialing: Option<Receiver<std::io::Result<TcpStream>>>,
-    /// Bytes dequeued from smoltcp that the peer socket has not accepted yet.
-    pending: Vec<u8>,
+    /// Bytes dequeued from smoltcp for the peer that it has not accepted yet.
+    to_peer: Vec<u8>,
+    /// Bytes read from the peer that the gateway has not accepted yet. Kept
+    /// until `tcp_send` takes them, so a stalled client loses nothing.
+    to_client: Vec<u8>,
     /// The client's write half closed; the peer socket was told with a FIN.
     client_closed: bool,
-    /// The peer's read half ended: EOF, a read error, or a failed dial.
+    /// The peer's read half reached EOF.
+    peer_eof: bool,
+    /// The client has been told the peer side ended (via `Close` or `Reset`).
     peer_closed: bool,
 }
 
@@ -147,8 +147,10 @@ impl TcpSpliceEngine {
             Flow {
                 peer: None,
                 dialing: Some(rx),
-                pending: Vec::new(),
+                to_peer: Vec::new(),
+                to_client: Vec::new(),
                 client_closed: false,
+                peer_eof: false,
                 peer_closed: false,
             },
         );
@@ -169,7 +171,7 @@ impl TcpSpliceEngine {
                 }
                 Some(Dial::Ready) => {
                     self.drain_from_client(gw, handle, &mut ops);
-                    self.read_from_peer(handle, &mut ops);
+                    self.pump_peer_to_client(gw, handle, &mut ops);
                     self.reap(handle);
                 }
             }
@@ -180,11 +182,12 @@ impl TcpSpliceEngine {
     /// Move the bytes waiting on the real socket for `handle` to the client.
     ///
     /// This is the reactor-driven half of [`Self::pump`]: call it when the real
-    /// socket becomes readable and apply the returned [`IoOp`]s to the gateway.
+    /// socket becomes readable. It only buffers the bytes (there is no gateway
+    /// here); the next [`Self::pump`] delivers them with backpressure.
     pub fn on_readable(&mut self, handle: SocketHandle) -> Vec<IoOp> {
         let mut ops = Vec::new();
         match self.flows.get_mut(&handle).map(Flow::advance_dial) {
-            Some(Dial::Ready) => self.read_from_peer(handle, &mut ops),
+            Some(Dial::Ready) => self.fill_from_peer(handle, &mut ops),
             Some(Dial::Failed) => {
                 if let Some(flow) = self.flows.get_mut(&handle) {
                     Self::tear_down(flow, handle, &mut ops);
@@ -196,25 +199,92 @@ impl TcpSpliceEngine {
         ops
     }
 
-    /// Copy whatever the peer socket has ready into the client-facing half.
-    fn read_from_peer(&mut self, handle: SocketHandle, ops: &mut Vec<IoOp>) {
-        if let Some(flow) = self.flows.get_mut(&handle)
-            && !flow.peer_closed
-        {
+    /// Move everything the peer has sent to the client.
+    ///
+    /// Bytes are held in the flow until `Gateway::tcp_send` accepts them — it
+    /// may take fewer than offered — so a stalled client loses nothing. Reading
+    /// from the real socket stops while that tail is non-empty, which pushes the
+    /// backpressure onto the peer socket's receive window.
+    fn pump_peer_to_client(&mut self, gw: &mut Gateway, handle: SocketHandle, ops: &mut Vec<IoOp>) {
+        let Some(flow) = self.flows.get_mut(&handle) else {
+            return;
+        };
+
+        loop {
+            if !flow.to_client.is_empty() {
+                match gw.tcp_send(handle, &flow.to_client) {
+                    // No room right now: keep the tail and retry on the next pump.
+                    Ok(0) => return,
+                    Ok(n) => {
+                        // `tcp_send` can take fewer bytes than offered but never
+                        // more; the tail it declines stays in `to_client`.
+                        debug_assert!(n <= flow.to_client.len(), "send accepted more than offered");
+                        flow.to_client.drain(..n);
+                    }
+                    Err(_) => {
+                        Self::tear_down(flow, handle, ops);
+                        return;
+                    }
+                }
+                if !flow.to_client.is_empty() {
+                    continue; // the rest goes in the same step
+                }
+            }
+
+            if flow.peer_eof {
+                Self::maybe_close(flow, handle, ops);
+                return;
+            }
+
             let mut buf = [0u8; CHUNK];
             let read = flow.peer.as_mut().map(|stream| stream.read(&mut buf));
             match read {
                 Some(Ok(0)) => {
-                    flow.peer_closed = true;
-                    ops.push(IoOp::Close { handle });
+                    flow.peer_eof = true;
+                    Self::maybe_close(flow, handle, ops);
+                    return;
                 }
-                Some(Ok(n)) => ops.push(IoOp::Send {
-                    handle,
-                    data: buf[..n].to_vec(),
-                }),
-                Some(Err(err)) if err.kind() == ErrorKind::WouldBlock => {}
-                Some(Err(_)) | None => Self::tear_down(flow, handle, ops),
+                Some(Ok(n)) => flow.to_client.extend_from_slice(&buf[..n]),
+                Some(Err(err)) if err.kind() == ErrorKind::WouldBlock => return,
+                Some(Err(_)) | None => {
+                    Self::tear_down(flow, handle, ops);
+                    return;
+                }
             }
+        }
+    }
+
+    /// Read whatever the peer has ready into the outgoing buffer, without
+    /// delivering it (there is no gateway here). This is the reactor-driven
+    /// counterpart of [`Self::pump_peer_to_client`].
+    fn fill_from_peer(&mut self, handle: SocketHandle, ops: &mut Vec<IoOp>) {
+        let Some(flow) = self.flows.get_mut(&handle) else {
+            return;
+        };
+        if flow.peer_eof || !flow.to_client.is_empty() {
+            Self::maybe_close(flow, handle, ops);
+            return;
+        }
+
+        let mut buf = [0u8; CHUNK];
+        let read = flow.peer.as_mut().map(|stream| stream.read(&mut buf));
+        match read {
+            Some(Ok(0)) => flow.peer_eof = true,
+            Some(Ok(n)) => flow.to_client.extend_from_slice(&buf[..n]),
+            Some(Err(err)) if err.kind() == ErrorKind::WouldBlock => {}
+            Some(Err(_)) | None => {
+                Self::tear_down(flow, handle, ops);
+                return;
+            }
+        }
+        Self::maybe_close(flow, handle, ops);
+    }
+
+    /// Tell the client the peer side ended, once all its bytes are delivered.
+    fn maybe_close(flow: &mut Flow, handle: SocketHandle, ops: &mut Vec<IoOp>) {
+        if flow.peer_eof && flow.to_client.is_empty() && !flow.peer_closed {
+            flow.peer_closed = true;
+            ops.push(IoOp::Close { handle });
         }
     }
 
@@ -232,14 +302,14 @@ impl TcpSpliceEngine {
 
         let mut buf = [0u8; CHUNK];
         loop {
-            if !flow.pending.is_empty() {
-                match flow.peer.as_mut().map(|stream| stream.write(&flow.pending)) {
+            if !flow.to_peer.is_empty() {
+                match flow.peer.as_mut().map(|stream| stream.write(&flow.to_peer)) {
                     Some(Ok(0)) => {
                         Self::tear_down(flow, handle, ops);
                         return;
                     }
                     Some(Ok(n)) => {
-                        flow.pending.drain(..n);
+                        flow.to_peer.drain(..n);
                     }
                     Some(Err(err)) if err.kind() == ErrorKind::WouldBlock => return,
                     Some(Err(_)) | None => {
@@ -247,14 +317,14 @@ impl TcpSpliceEngine {
                         return;
                     }
                 }
-                if !flow.pending.is_empty() {
+                if !flow.to_peer.is_empty() {
                     return; // still backed up; do not dequeue more
                 }
             }
 
             match gw.tcp_recv(handle, &mut buf) {
                 Ok(0) => return,
-                Ok(n) => flow.pending.extend_from_slice(&buf[..n]),
+                Ok(n) => flow.to_peer.extend_from_slice(&buf[..n]),
                 Err(RecvError::Finished) => {
                     if let Some(stream) = flow.peer.as_ref() {
                         let _ = stream.shutdown(Shutdown::Write);
@@ -306,6 +376,7 @@ impl TcpSpliceEngine {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
@@ -348,7 +419,8 @@ mod tests {
         payload: Vec<u8>,
     }
 
-    /// A hand-built IPv4/TCP packet with valid IPv4 and TCP checksums.
+    /// A hand-built IPv4/TCP packet with valid IPv4 and TCP checksums and a full
+    /// advertised window.
     fn tcp_packet(
         src: SocketAddr,
         dst: SocketAddr,
@@ -356,6 +428,19 @@ mod tests {
         ack: Option<u32>,
         flags: u8,
         payload: &[u8],
+    ) -> Vec<u8> {
+        tcp_packet_with_window(src, dst, seq, ack, flags, payload, 65535)
+    }
+
+    /// As [`tcp_packet`], with an explicit advertised receive window.
+    fn tcp_packet_with_window(
+        src: SocketAddr,
+        dst: SocketAddr,
+        seq: u32,
+        ack: Option<u32>,
+        flags: u8,
+        payload: &[u8],
+        window: u16,
     ) -> Vec<u8> {
         let (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) = (src.ip(), dst.ip()) else {
             panic!("tests build IPv4 packets only");
@@ -385,7 +470,7 @@ mod tests {
         }
         tcp[12] = 5 << 4; // data offset: 20 byte header
         tcp[13] = flags;
-        tcp[14..16].copy_from_slice(&65535u16.to_be_bytes()); // window
+        tcp[14..16].copy_from_slice(&window.to_be_bytes());
         tcp[20..].copy_from_slice(payload);
 
         // TCP checksum over the pseudo-header plus the segment.
@@ -449,19 +534,36 @@ mod tests {
     }
 
     /// Apply the engine's [`IoOp`]s to the gateway.
+    ///
+    /// Peer-to-client bytes are no longer handed to the caller: the engine owns
+    /// them and keeps any tail `Gateway::tcp_send` declines, so there is no
+    /// accepted-count invariant to assert here. The only ops left are terminal.
     fn apply(gw: &mut Gateway, ops: Vec<IoOp>) {
         for op in ops {
             match op {
-                IoOp::Send { handle, data } => {
-                    let n = gw
-                        .tcp_send(handle, &data)
-                        .expect("the connection accepts data");
-                    assert_eq!(n, data.len(), "a whole chunk fits in the send buffer");
-                }
                 IoOp::Close { handle } => gw.tcp_close(handle),
                 IoOp::Reset { handle } => gw.tcp_abort(handle),
             }
         }
+    }
+
+    /// Collect the payload bytes the gateway has sent to the client, keyed by
+    /// absolute sequence number so retransmissions cannot duplicate them.
+    fn harvest(gw: &mut Gateway, client: SocketAddr, seen: &mut BTreeMap<u32, u8>) -> bool {
+        let mut fin = false;
+        for pkt in gw.take_tx() {
+            let parsed = parse(&pkt);
+            if parsed.dst != client {
+                continue;
+            }
+            if parsed.flags & FIN != 0 {
+                fin = true;
+            }
+            for (i, byte) in parsed.payload.iter().enumerate() {
+                seen.insert(parsed.seq.wrapping_add(i as u32), *byte);
+            }
+        }
+        fin
     }
 
     /// A `tokio` echo server bound to a loopback port.
@@ -484,6 +586,23 @@ mod tests {
                 write.write_all(&buf[..n]).await.expect("write");
             }
             write.shutdown().await.expect("shutdown");
+        });
+        (addr, task)
+    }
+
+    /// A `tokio` server that writes `n` deterministic bytes then half-closes.
+    async fn data_server(n: usize) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("local address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept one connection");
+            let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            stream.write_all(&data).await.expect("send the payload");
+            stream.shutdown().await.expect("shutdown");
         });
         (addr, task)
     }
@@ -760,9 +879,7 @@ mod tests {
         let ops = engine.pump(&mut gw);
         let touches_a = ops.iter().any(|op| {
             let handle = match op {
-                IoOp::Send { handle, .. } | IoOp::Close { handle } | IoOp::Reset { handle } => {
-                    *handle
-                }
+                IoOp::Close { handle } | IoOp::Reset { handle } => *handle,
             };
             handle == handle_a
         });
@@ -771,5 +888,85 @@ mod tests {
             !engine.closed_handles().contains(&handle_a),
             "the pending dial must not be torn down"
         );
+    }
+
+    /// A stalled client (zero receive window) must not cause loss of
+    /// peer→client bytes: the engine has to apply backpressure instead of
+    /// offering the gateway more than it can hold.
+    #[tokio::test]
+    async fn peer_bytes_survive_a_stalled_client() {
+        const N: u32 = 20_000;
+        let (dst, server) = data_server(N as usize).await;
+        let client: SocketAddr = "10.10.10.1:53004".parse().unwrap();
+
+        let mut gw = Gateway::new(GW_ADDR, GW_PREFIX, MTU);
+        let mut engine = TcpSpliceEngine::new();
+        let (handle, base, client_seq) = handshake(&mut gw, client, dst);
+        engine.on_accept(handle, client, dst);
+
+        // The client stops reading: advertise a zero receive window before any
+        // data flows, so the gateway cannot transmit to it.
+        gw.push_rx(tcp_packet_with_window(
+            client,
+            dst,
+            client_seq,
+            Some(base),
+            ACK,
+            &[],
+            0,
+        ));
+        gw.poll(Instant::now());
+
+        let mut seen: BTreeMap<u32, u8> = BTreeMap::new();
+        let mut fin = false;
+
+        // Phase 1: keep pumping while the client is stalled. The gateway's 8 KiB
+        // transmit buffer fills; the engine must stop taking bytes off the real
+        // socket rather than lose the overflow.
+        for _ in 0..100 {
+            gw.poll(Instant::now());
+            let ops = engine.pump(&mut gw);
+            apply(&mut gw, ops);
+            gw.poll(Instant::now());
+            fin |= harvest(&mut gw, client, &mut seen);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Phase 2: the client resumes reading and acknowledges as bytes arrive.
+        for _ in 0..5000 {
+            gw.poll(Instant::now());
+            let ops = engine.pump(&mut gw);
+            apply(&mut gw, ops);
+            gw.poll(Instant::now());
+            fin |= harvest(&mut gw, client, &mut seen);
+            let contiguous = (0..N)
+                .take_while(|i| seen.contains_key(&(base + i)))
+                .count();
+            let ack = base + contiguous as u32 + u32::from(fin && contiguous == N as usize);
+            gw.push_rx(tcp_packet_with_window(
+                client,
+                dst,
+                client_seq,
+                Some(ack),
+                ACK,
+                &[],
+                65535,
+            ));
+            if contiguous == N as usize {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let expected: Vec<u8> = (0..N as usize).map(|i| (i % 251) as u8).collect();
+        let received: Vec<u8> = (0..N)
+            .map(|i| *seen.get(&(base + i)).expect("every byte arrived"))
+            .collect();
+        assert_eq!(
+            received, expected,
+            "no peer→client byte is lost to a stalled client"
+        );
+
+        server.await.expect("data server task");
     }
 }
