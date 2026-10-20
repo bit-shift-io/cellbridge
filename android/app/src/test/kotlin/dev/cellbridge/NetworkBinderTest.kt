@@ -1,0 +1,300 @@
+package dev.cellbridge
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkInfo
+import android.os.Build
+import java.net.DatagramSocket
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowNetwork
+import org.robolectric.shadows.ShadowNetworkCapabilities
+import org.robolectric.shadows.ShadowNetworkInfo
+
+/**
+ * The Android platform layer is the only part of CellBridge an unrooted Rust
+ * process cannot do for itself: choosing the cellular (internet egress) and
+ * Wi-Fi (WireGuard-to-router) networks and pinning sockets to them.
+ *
+ * Everything here runs under Robolectric. The one thing Robolectric cannot do
+ * is hand out a real descriptor for a `DatagramSocket` — `ParcelFileDescriptor
+ * .fromDatagramSocket` needs the hidden `DatagramSocket.getFileDescriptor$()`.
+ * Those tests therefore verify the *ownership* contract through an injected
+ * handover, not a real fd.
+ */
+// The Robolectric SDK is pinned rather than left to the harness default: without
+// `unitTests.isIncludeAndroidResources` Robolectric cannot read the manifest and
+// falls back to API 23 (below our minSdk). API 36 cannot initialise its
+// `ApplicationSharedMemory` on the JDK 21 this project builds with, so 35 is the
+// newest SDK the suite can run on.
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
+class NetworkBinderTest {
+
+    private lateinit var cm: ConnectivityManager
+    private lateinit var wifi: Network
+    private lateinit var cellular: Network
+    private lateinit var binder: NetworkBinder
+
+    @Before
+    fun setUp() {
+        val context = RuntimeEnvironment.getApplication()
+        cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        // Drop the shadow's default Wi-Fi/mobile networks so each test owns the
+        // exact set it asserts against.
+        shadowOf(cm).clearAllNetworks()
+        wifi = addNetwork(NET_ID_WIFI, NetworkCapabilities.TRANSPORT_WIFI)
+        cellular = addNetwork(NET_ID_CELLULAR, NetworkCapabilities.TRANSPORT_CELLULAR)
+        binder = NetworkBinder(cm)
+    }
+
+    @After
+    fun tearDown() {
+        binder.stop()
+    }
+
+    @Test
+    fun cellularNetwork_selects_the_cellular_network() {
+        assertSame(cellular, binder.cellularNetwork())
+    }
+
+    @Test
+    fun wifiNetwork_selects_the_wifi_network() {
+        assertSame(wifi, binder.wifiNetwork())
+    }
+
+    @Test
+    fun cellularNetwork_is_null_without_a_cellular_network() {
+        shadowOf(cm).removeNetwork(cellular)
+
+        assertNull("no cellular network must be null, never Wi-Fi", binder.cellularNetwork())
+        assertSame(wifi, binder.wifiNetwork())
+    }
+
+    @Test
+    fun wifiNetwork_is_null_without_a_wifi_network() {
+        shadowOf(cm).removeNetwork(wifi)
+
+        assertNull(binder.wifiNetwork())
+        assertSame(cellular, binder.cellularNetwork())
+    }
+
+    @Test
+    fun bindProcess_binds_the_process_to_the_cellular_network() {
+        binder.bindProcess(cellular)
+
+        assertSame(cellular, cm.boundNetworkForProcess)
+    }
+
+    @Test
+    fun onAvailable_reports_the_cellular_transport() {
+        val recorder = Recorder()
+        binder.events = recorder
+
+        binder.onAvailable(cellular)
+
+        assertEquals(listOf("cellular up"), recorder.calls)
+    }
+
+    @Test
+    fun onLost_reports_the_cellular_transport() {
+        val recorder = Recorder()
+        binder.events = recorder
+
+        binder.onLost(cellular)
+
+        assertEquals(listOf("cellular down"), recorder.calls)
+    }
+
+    @Test
+    fun onAvailable_reports_the_wifi_transport() {
+        val recorder = Recorder()
+        binder.events = recorder
+
+        binder.onAvailable(wifi)
+
+        assertEquals(listOf("wifi up"), recorder.calls)
+    }
+
+    @Test
+    fun onLost_reports_the_wifi_transport() {
+        val recorder = Recorder()
+        binder.events = recorder
+
+        binder.onLost(wifi)
+
+        assertEquals(listOf("wifi down"), recorder.calls)
+    }
+
+    /**
+     * Events are keyed on the *transport*, not on network identity: Android
+     * hands out a fresh [Network] object after a re-connect.
+     */
+    @Test
+    fun a_reconnected_wifi_network_still_reports() {
+        val reconnected = addNetwork(NET_ID_WIFI + 10, NetworkCapabilities.TRANSPORT_WIFI)
+        val recorder = Recorder()
+        binder.events = recorder
+
+        binder.onAvailable(reconnected)
+
+        assertEquals(listOf("wifi up"), recorder.calls)
+    }
+
+    @Test
+    fun transport_events_ignore_unrelated_networks() {
+        val vpn = addNetwork(NET_ID_WIFI + 20, NetworkCapabilities.TRANSPORT_VPN)
+        val recorder = Recorder()
+        binder.events = recorder
+
+        binder.onAvailable(vpn)
+        binder.onLost(vpn)
+
+        assertTrue("an unrelated transport must not fire", recorder.calls.isEmpty())
+    }
+
+    @Test
+    fun transport_events_ignore_a_network_with_no_capabilities() {
+        val unknown = addNetwork(NET_ID_WIFI + 30, transport = null)
+        val recorder = Recorder()
+        binder.events = recorder
+
+        binder.onAvailable(unknown)
+        binder.onLost(unknown)
+
+        assertTrue("a network with unknown capabilities must not fire", recorder.calls.isEmpty())
+    }
+
+    @Test
+    fun transport_events_are_silent_when_no_listener_is_attached() {
+        // Must not throw.
+        binder.onAvailable(cellular)
+        binder.onLost(wifi)
+    }
+
+    @Test
+    fun start_registers_once_and_is_idempotent() {
+        val shadow = shadowOf(cm)
+        assertEquals("nothing is registered before start", 0, shadow.networkCallbacks.size)
+
+        binder.start()
+        val afterFirst = shadow.networkCallbacks.size
+        assertTrue("start registers a callback", afterFirst > 0)
+
+        binder.start()
+        assertEquals("a second start must not leak another callback", afterFirst, shadow.networkCallbacks.size)
+    }
+
+    @Test
+    fun stop_unregisters_everything_and_is_idempotent() {
+        binder.start()
+        binder.stop()
+
+        assertTrue("stop unregisters every callback", shadowOf(cm).networkCallbacks.isEmpty())
+
+        binder.stop() // Must not throw.
+        assertTrue(shadowOf(cm).networkCallbacks.isEmpty())
+    }
+
+    @Test
+    fun bindWifiSocket_binds_the_socket_to_the_wifi_network() {
+        var handedOver: DatagramSocket? = null
+        val binder = NetworkBinder(cm) { socket -> handedOver = socket; STUB_FD }
+
+        val fd = binder.bindWifiSocket(wifi)
+
+        assertEquals(STUB_FD, fd)
+        val socket = requireNotNull(handedOver)
+        assertTrue("the socket must be bound to Wi-Fi", shadowOf(wifi).isSocketBound(socket))
+    }
+
+    /**
+     * API 29+: `fromDatagramSocket` hands back a *dup*, so Rust's descriptor is
+     * independent of the socket. Closing the socket is then safe and avoids
+     * leaking one descriptor per handover.
+     */
+    @Test
+    fun on_api_29_and_later_the_socket_is_closed_after_handover() {
+        assertTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+
+        var handedOver: DatagramSocket? = null
+        val binder = NetworkBinder(cm) { socket -> handedOver = socket; STUB_FD }
+
+        binder.bindWifiSocket(wifi)
+
+        assertTrue("the dup makes closing the socket safe", requireNotNull(handedOver).isClosed)
+    }
+
+    /**
+     * Pre-API-29 `fromDatagramSocket` does *not* dup: the ParcelFileDescriptor
+     * and the DatagramSocket share one descriptor. The socket must therefore be
+     * retained and never closed, or its finalizer could close the descriptor
+     * Rust now owns.
+     */
+    @Test
+    @Config(sdk = [28])
+    fun before_api_29_the_socket_is_retained_so_its_finalizer_cannot_close_the_fd() {
+        assertTrue(Build.VERSION.SDK_INT < Build.VERSION_CODES.Q)
+
+        var handedOver: DatagramSocket? = null
+        val binder = NetworkBinder(cm) { socket -> handedOver = socket; STUB_FD }
+
+        binder.bindWifiSocket(wifi)
+
+        assertFalse("the shared descriptor must stay open", requireNotNull(handedOver).isClosed)
+    }
+
+    private fun addNetwork(id: Int, transport: Int?): Network {
+        val network = ShadowNetwork.newInstance(id)
+        val info = ShadowNetworkInfo.newInstance(
+            NetworkInfo.DetailedState.CONNECTED,
+            if (transport == NetworkCapabilities.TRANSPORT_CELLULAR) {
+                ConnectivityManager.TYPE_MOBILE
+            } else {
+                ConnectivityManager.TYPE_WIFI
+            },
+            0,
+            true,
+            true,
+        )
+        val shadow = shadowOf(cm)
+        shadow.addNetwork(network, info)
+        if (transport != null) {
+            val capabilities = ShadowNetworkCapabilities.newInstance()
+            shadowOf(capabilities).addTransportType(transport)
+            shadow.setNetworkCapabilities(network, capabilities)
+        }
+        return network
+    }
+
+    private class Recorder : NetworkEvents {
+        val calls = mutableListOf<String>()
+
+        override fun onCellularChanged(up: Boolean) {
+            calls += if (up) "cellular up" else "cellular down"
+        }
+
+        override fun onWifiChanged(up: Boolean) {
+            calls += if (up) "wifi up" else "wifi down"
+        }
+    }
+
+    private companion object {
+        const val NET_ID_WIFI = 1
+        const val NET_ID_CELLULAR = 2
+        const val STUB_FD = 4242
+    }
+}
