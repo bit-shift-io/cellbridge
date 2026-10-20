@@ -149,8 +149,12 @@ impl UdpForwarder {
         counters: Arc<StatsCounters>,
     ) -> UdpForwarder {
         UdpForwarder {
+            max_flows,
+            idle_timeout,
+            flows: HashMap::new(),
+            by_activity: BTreeMap::new(),
+            next_seq: 0,
             counters,
-            ..UdpForwarder::new(max_flows, idle_timeout)
         }
     }
 

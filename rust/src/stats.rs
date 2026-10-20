@@ -168,10 +168,13 @@ impl BridgeMonitor {
     /// connections on a healthy link every rekey window.
     ///
     /// While the link is up the state becomes [`BridgeState::Connected`]. While
-    /// it is down and the bridge was connected, the down window is timed; past
-    /// `grace` the state becomes [`BridgeState::Error`] and
-    /// [`LinkEvent::Lost`] is returned exactly once, so the caller tears every
-    /// flow down.
+    /// it is down, the down window is timed from the first observation. Past
+    /// `grace` the state becomes [`BridgeState::Error`] and [`LinkEvent::Lost`]
+    /// is returned exactly once, so the caller tears every flow down — and this
+    /// applies to a bridge that never came up as well: a phone that cannot
+    /// reach its endpoint must surface an error rather than report
+    /// [`BridgeState::Connecting`] forever. Only [`BridgeState::Idle`] is
+    /// exempt, because an app that was never started has no uplink to lose.
     pub fn observe(&mut self, connected: bool, now: Instant) -> LinkEvent {
         if connected {
             let recovering = self.down_since.is_some() || self.state != BridgeState::Connected;
@@ -185,10 +188,9 @@ impl BridgeMonitor {
             };
         }
 
-        // A link that is down before it ever came up is not a loss: there is
-        // nothing to tear down, and a misconfigured endpoint must read as
-        // Connecting rather than Error.
-        if self.state != BridgeState::Connected && self.state != BridgeState::Error {
+        // Never started ([`Self::stop`] leaves the monitor here): there is no
+        // uplink to lose, so nothing is timed.
+        if self.state == BridgeState::Idle {
             return LinkEvent::None;
         }
 
@@ -197,6 +199,8 @@ impl BridgeMonitor {
             return LinkEvent::None;
         }
 
+        // Both `Connecting` and `Connected` are timed: a link that never
+        // handshook is as dead as one that dropped, and must be reported.
         match self.down_since {
             None => {
                 self.down_since = Some(now);
@@ -288,13 +292,15 @@ mod tests {
         monitor.start();
         assert_eq!(monitor.status().state, BridgeState::Connecting);
 
-        // A link that never comes up is *not* a loss: there was nothing
-        // connected to lose, so the state stays Connecting however long it is
-        // down (a bogus endpoint must report Connecting, not Error).
-        assert_eq!(monitor.observe(false, t0 + grace() * 4), LinkEvent::None);
+        // A link that has not handshook yet is still `Connecting` inside the
+        // grace period: the handshake may complete at any moment.
+        assert_eq!(monitor.observe(false, t0), LinkEvent::Down);
         assert_eq!(monitor.status().state, BridgeState::Connecting);
 
-        assert_eq!(monitor.observe(true, t0), LinkEvent::Connected);
+        assert_eq!(
+            monitor.observe(true, t0 + Duration::from_secs(1)),
+            LinkEvent::Connected
+        );
         assert_eq!(
             monitor.status(),
             BridgeStatus {
@@ -302,6 +308,40 @@ mod tests {
                 error: None,
             }
         );
+    }
+
+    /// The grace period starts at [`BridgeMonitor::start`]: a bridge that never
+    /// handshakes must surface `Error`, not sit in `Connecting` forever.
+    #[test]
+    fn a_bridge_that_never_connects_reports_error_after_grace() {
+        let mut monitor = BridgeMonitor::new(grace());
+        let t0 = Instant::now();
+        monitor.start();
+
+        assert_eq!(monitor.observe(false, t0), LinkEvent::Down);
+        assert_eq!(
+            monitor.status().state,
+            BridgeState::Connecting,
+            "still inside the grace period"
+        );
+
+        assert_eq!(
+            monitor.observe(false, t0 + grace() + Duration::from_secs(1)),
+            LinkEvent::Lost,
+            "the handshake never completed and the grace period elapsed"
+        );
+        let status = monitor.status();
+        assert_eq!(status.state, BridgeState::Error);
+        assert!(
+            status.error.is_some(),
+            "an unreachable endpoint must carry a reason"
+        );
+
+        // A monitor that was never started stays `Idle`: there is no uplink to
+        // have lost, and no error to report.
+        let mut idle = BridgeMonitor::new(grace());
+        assert_eq!(idle.observe(false, t0 + grace() * 10), LinkEvent::None);
+        assert_eq!(idle.status().state, BridgeState::Idle);
     }
 
     #[test]
@@ -371,7 +411,10 @@ mod tests {
         assert_eq!(monitor.status().state, BridgeState::Error);
 
         // When the link returns, the monitor recovers.
-        assert_eq!(monitor.observe(true, t0 + grace() * 4), LinkEvent::Connected);
+        assert_eq!(
+            monitor.observe(true, t0 + grace() * 4),
+            LinkEvent::Connected
+        );
         assert_eq!(
             monitor.status(),
             BridgeStatus {

@@ -23,25 +23,27 @@ use support::*;
 /// rather than hanging.
 async fn drive(
     bridge: &mut Bridge,
-    tcp_client: &mut TcpClient,
+    clients: &mut [TcpClient],
     seen: &mut ClientSeen,
     what: &str,
-    mut done: impl FnMut(&Bridge, &TcpClient, &ClientSeen) -> bool,
+    mut done: impl FnMut(&Bridge, &[TcpClient], &ClientSeen) -> bool,
 ) {
     let deadline = StdInstant::now() + DRIVE_TIMEOUT;
     let mut last_tick = StdInstant::now();
-    while !done(bridge, tcp_client, seen) {
+    while !done(bridge, clients, seen) {
         assert!(StdInstant::now() < deadline, "the bridge never {what}");
 
         let (to_client, _link) = bridge.step().await.expect("bridge step");
-        client_react(
-            &mut bridge.wire,
-            tcp_client,
-            TCP_CLIENT_ADDR,
-            UDP_CLIENT_ADDR,
-            &to_client,
-            seen,
-        );
+        for client in clients.iter_mut() {
+            client_react(
+                &mut bridge.wire,
+                client,
+                TCP_CLIENT_ADDR,
+                UDP_CLIENT_ADDR,
+                &to_client,
+                seen,
+            );
+        }
 
         if last_tick.elapsed() >= TICK_INTERVAL {
             tick(bridge);
@@ -99,11 +101,11 @@ async fn counters_count_the_bytes_that_actually_cross() {
     // reaped, so the flow count is what the tables say it is.
     drive(
         &mut bridge,
-        &mut tcp_client,
+        std::slice::from_mut(&mut tcp_client),
         &mut seen,
         "finished the round trip",
-        |bridge, tcp_client, seen| {
-            tcp_client.finished()
+        |bridge, clients, seen| {
+            clients[0].finished()
                 && seen.udp_reply.is_some()
                 && bridge.splice.flow_count() == 0
                 && bridge.status().state == BridgeState::Connected
@@ -123,10 +125,7 @@ async fn counters_count_the_bytes_that_actually_cross() {
         stats.tx_bytes, 9,
         "5 bytes of TCP request plus 4 of UDP request"
     );
-    assert_eq!(
-        stats.rx_bytes, 9,
-        "5 bytes of TCP echo plus 4 of UDP reply"
-    );
+    assert_eq!(stats.rx_bytes, 9, "5 bytes of TCP echo plus 4 of UDP reply");
     assert_eq!(
         stats.active_flows,
         bridge.splice.flow_count() + bridge.forwarder.len(),
@@ -147,38 +146,57 @@ async fn counters_count_the_bytes_that_actually_cross() {
         .expect("UDP echo server task");
 }
 
-/// Spec review item 4: the tunnel dies mid-traffic.
+/// Spec review item 4: the tunnel dies mid-traffic, and *every* flow goes —
+/// not just the first one the teardown happens to look at.
 #[tokio::test]
 async fn tunnel_loss_tears_down_all_flows() {
-    let (tcp_dst, tcp_server) = tcp_echo_server().await;
+    let (tcp_dst_a, tcp_server_a) = tcp_echo_server().await;
+    let (tcp_dst_b, tcp_server_b) = tcp_echo_server().await;
     let (udp_dst, _udp_server) = udp_echo_server().await;
 
     let mut bridge = Bridge::new_with_grace(Duration::from_millis(200)).await;
     bridge.wire.connect().await;
-    let (mut tcp_client, mut seen) = open_flows(&mut bridge, tcp_dst, udp_dst);
-    // The connection has to still be open when the uplink dies.
-    tcp_client.keep_open();
+
+    // Two concurrent TCP splices, plus a UDP flow. Two handles are the point:
+    // a teardown that only closes one would pass a one-handle test.
+    let mut first = TcpClient::new(TCP_CLIENT_ADDR, tcp_dst_a);
+    let mut second = TcpClient::new(TCP_CLIENT_ADDR, tcp_dst_b);
+    for client in [&first, &second] {
+        bridge
+            .wire
+            .send_from_client(&client.syn())
+            .expect("inject a SYN");
+    }
+    bridge
+        .wire
+        .send_from_client(&build_udp_reply(UDP_CLIENT_ADDR, udp_dst, b"ping"))
+        .expect("inject the UDP datagram");
+    let mut seen = ClientSeen::default();
+
+    // Both connections have to still be open when the uplink dies.
+    first.keep_open();
+    second.keep_open();
 
     drive(
         &mut bridge,
-        &mut tcp_client,
+        &mut [first, second],
         &mut seen,
-        "brought both flows up",
-        |bridge, tcp_client, seen| {
-            tcp_client.echoed()
+        "brought every flow up",
+        |bridge, clients, seen| {
+            clients.iter().all(TcpClient::echoed)
                 && seen.udp_reply.is_some()
-                && bridge.splice.flow_count() == 1
+                && bridge.splice.flow_count() == 2
                 && bridge.forwarder.len() == 1
         },
     )
     .await;
 
     let handles_before = bridge.handles.clone();
-    assert_eq!(handles_before.len(), 1, "one spliced connection");
+    assert_eq!(handles_before.len(), 2, "two spliced connections");
     assert_eq!(
         bridge.stats().active_flows,
-        2,
-        "one TCP splice and one UDP flow are live"
+        3,
+        "two TCP splices and one UDP flow are live"
     );
 
     // The uplink dies. The tunnel is gone, and says so.
@@ -209,7 +227,7 @@ async fn tunnel_loss_tears_down_all_flows() {
         );
         assert_eq!(
             bridge.splice.flow_count(),
-            1,
+            2,
             "no flow is torn down before the grace period elapses"
         );
         assert_eq!(bridge.forwarder.len(), 1);
@@ -226,33 +244,43 @@ async fn tunnel_loss_tears_down_all_flows() {
     // The loop's response to `LinkEvent::Lost`.
     let torn = bridge.tear_down_all();
 
-    // `TcpSpliceEngine::closed_handles` covered every handle the engine held.
+    // `TcpSpliceEngine::closed_handles` covered *every* handle the engine held.
     assert_eq!(
-        torn, handles_before,
-        "every spliced handle is reported closed by the teardown"
+        torn.len(),
+        handles_before.len(),
+        "the same number of handles is reported closed as were live"
     );
+    for handle in &handles_before {
+        assert!(
+            torn.contains(handle),
+            "handle {handle:?} from the live set is missing from the teardown"
+        );
+    }
     assert_eq!(bridge.torn_down_udp.len(), 1, "the UDP flow is dropped too");
     assert_eq!(bridge.torn_down_udp[0].client, UDP_CLIENT_ADDR);
 
-    // The client is reset, not left hanging and not told the response ended.
-    let mut saw_reset = false;
-    let mut saw_fin = false;
-    for packet in &bridge.torn_down_packets {
-        if let Some(segment) = parse_tcp(packet)
-            && segment.dst == TCP_CLIENT_ADDR
-        {
-            saw_reset |= segment.flags & RST != 0;
-            saw_fin |= segment.flags & FIN != 0;
+    // Every client is reset, not left hanging and not told the response ended.
+    for dst in [tcp_dst_a, tcp_dst_b] {
+        let mut saw_reset = false;
+        let mut saw_fin = false;
+        for packet in &bridge.torn_down_packets {
+            if let Some(segment) = parse_tcp(packet)
+                && segment.dst == TCP_CLIENT_ADDR
+                && segment.src == dst
+            {
+                saw_reset |= segment.flags & RST != 0;
+                saw_fin |= segment.flags & FIN != 0;
+            }
         }
+        assert!(saw_reset, "the client of {dst} sees a reset");
+        assert!(
+            !saw_fin,
+            "a dead uplink must not look like a clean end of response"
+        );
     }
-    assert!(saw_reset, "the client sees a reset");
-    assert!(
-        !saw_fin,
-        "a dead uplink must not look like a clean end of response"
-    );
 
     // Nothing is left behind: the tables are empty, the counter agrees, and the
-    // gateway has freed the connection's buffers.
+    // gateway has freed the connections' buffers.
     assert_eq!(bridge.splice.flow_count(), 0);
     assert!(bridge.forwarder.is_empty());
     assert_eq!(
@@ -262,20 +290,23 @@ async fn tunnel_loss_tears_down_all_flows() {
     );
     assert_eq!(
         bridge.stats().tx_bytes,
-        9,
-        "a teardown does not discard the totals"
+        14,
+        "a teardown does not discard the totals (2 x 5 TCP + 4 UDP)"
     );
     assert_eq!(
         bridge.gateway.socket_count(),
         1,
-        "only the inert ICMP socket is left once the splice's socket is freed"
+        "only the inert ICMP socket is left once both splices' sockets are freed"
     );
 
-    // The real socket was closed, which is what the echo server was waiting for.
-    tokio::time::timeout(Duration::from_secs(5), tcp_server)
-        .await
-        .expect("the real socket was closed rather than leaked")
-        .expect("TCP echo server task");
+    // The real sockets were closed, which is what the echo servers were waiting
+    // for.
+    for (server, which) in [(tcp_server_a, "first"), (tcp_server_b, "second")] {
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the real socket was closed rather than leaked")
+            .unwrap_or_else(|err| panic!("{which} TCP echo server task: {err}"));
+    }
 
     // --- a new flow starts clean -------------------------------------------
     let (tcp_dst, tcp_server) = tcp_echo_server().await;
@@ -287,12 +318,12 @@ async fn tunnel_loss_tears_down_all_flows() {
 
     drive(
         &mut bridge,
-        &mut tcp_client,
+        std::slice::from_mut(&mut tcp_client),
         &mut seen,
         "recovered with fresh flows",
-        |bridge, tcp_client, seen| {
+        |bridge, clients, seen| {
             bridge.status().state == BridgeState::Connected
-                && tcp_client.echoed()
+                && clients[0].echoed()
                 && seen.udp_reply.is_some()
         },
     )
@@ -311,20 +342,20 @@ async fn tunnel_loss_tears_down_all_flows() {
     );
     assert_eq!(
         bridge.stats().tx_bytes,
-        18,
-        "the totals keep accumulating across the loss"
+        23,
+        "the totals keep accumulating across the loss (14 + 5 TCP + 4 UDP)"
     );
     assert_eq!(
         bridge.accepted.len(),
-        2,
-        "the recovered connection was accepted, like the first"
+        3,
+        "the recovered connection was accepted, like the two before it"
     );
 
     // Let the recovered connection finish normally, so the echo server sees its
     // EOF and the splice is reaped.
     drive(
         &mut bridge,
-        &mut tcp_client,
+        std::slice::from_mut(&mut tcp_client),
         &mut seen,
         "finished the recovered connection",
         |bridge, _, _| bridge.splice.flow_count() == 0,
@@ -355,11 +386,11 @@ async fn an_outage_inside_the_grace_keeps_the_flows() {
 
     drive(
         &mut bridge,
-        &mut tcp_client,
+        std::slice::from_mut(&mut tcp_client),
         &mut seen,
         "brought both flows up",
-        |bridge, tcp_client, seen| {
-            tcp_client.echoed()
+        |bridge, clients, seen| {
+            clients[0].echoed()
                 && seen.udp_reply.is_some()
                 && bridge.splice.flow_count() == 1
                 && bridge.forwarder.len() == 1
@@ -401,7 +432,11 @@ async fn an_outage_inside_the_grace_keeps_the_flows() {
 
     // Both flows are still there, and the splice still works: the client
     // finishes its half-close and the real server sees the whole connection.
-    assert_eq!(bridge.splice.flow_count(), 1, "the splice was never torn down");
+    assert_eq!(
+        bridge.splice.flow_count(),
+        1,
+        "the splice was never torn down"
+    );
     assert_eq!(bridge.forwarder.len(), 1);
 
     bridge
@@ -411,10 +446,10 @@ async fn an_outage_inside_the_grace_keeps_the_flows() {
 
     drive(
         &mut bridge,
-        &mut tcp_client,
+        std::slice::from_mut(&mut tcp_client),
         &mut seen,
         "finished the connection after the gap",
-        |bridge, tcp_client, _| tcp_client.finished() && bridge.splice.flow_count() == 0,
+        |bridge, clients, _| clients[0].finished() && bridge.splice.flow_count() == 0,
     )
     .await;
 

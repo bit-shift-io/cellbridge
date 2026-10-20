@@ -26,7 +26,9 @@ const TCP_BUFFER_SIZE: usize = 8192;
 /// ~16 KiB of buffers, so the pool has to be bounded: past this many idle
 /// listeners the least recently used one is closed to make room for the port
 /// that needs it. Nothing is lost by reaping — a listener is recreated on
-/// demand, so the only cost is the buffers.
+/// demand, so the only cost is the buffers. This is a steady-state invariant,
+/// enforced again after every [`Gateway::poll`] so a batch of more than this
+/// many ports cannot leave the pool sitting above it.
 const MAX_IDLE_LISTENERS: usize = 64;
 
 /// The IPv4 protocol number for UDP.
@@ -66,10 +68,11 @@ pub enum GatewayEvent {
 /// When one accepts, it becomes the connection and a fresh listener is created
 /// the next time a SYN for that port arrives.
 ///
-/// The idle pool is bounded: once it holds [`MAX_IDLE_LISTENERS`] listeners,
-/// creating one for a new port first closes the least recently used one, so a
-/// stream of SYNs to fresh ports — a scan, or a SYN the stack drops — cannot
-/// grow the socket set without bound.
+/// The idle pool is bounded: creating one for a new port first closes the least
+/// recently used one, and once a poll has drained the batch of SYNs that
+/// prompted the growth the pool is trimmed back to [`MAX_IDLE_LISTENERS`]. A
+/// stream of SYNs to fresh ports — a scan, or a SYN the stack drops — therefore
+/// cannot grow the socket set without bound.
 pub struct Gateway {
     device: QueueDevice,
     iface: Interface,
@@ -168,7 +171,14 @@ impl Gateway {
     pub fn poll(&mut self, now: Instant) -> Vec<GatewayEvent> {
         self.open_pending_listeners(now);
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        self.drain_accepts()
+        let events = self.drain_accepts();
+        // Every SYN this batch queued has now been consumed or dropped, so any
+        // listener still idle can be reaped. The mid-batch reaping spares
+        // listeners whose SYN is still queued, which lets one oversized batch
+        // push the pool above the cap; trimming here restores the bound so the
+        // high-water mark does not persist.
+        self.trim_idle_listeners();
+        events
     }
 
     /// Make sure every pending SYN has an idle listener to match against.
@@ -236,7 +246,8 @@ impl Gateway {
     /// A listener whose port is in `pending` is spared: a SYN for it is already
     /// queued for the stack, and reaping its listener would drop that SYN. If
     /// every idle listener is spoken for, the pool is allowed to sit above the
-    /// cap for this batch rather than break a connection.
+    /// cap for the rest of this batch; [`Self::trim_idle_listeners`] brings it
+    /// back once the batch has been through the stack.
     fn reap_idle_listener(&mut self, pending: &[u16]) {
         if self.listeners.len() < MAX_IDLE_LISTENERS {
             return;
@@ -250,6 +261,28 @@ impl Gateway {
             .map(|(index, _)| index);
         if let Some(index) = victim {
             let listener = self.listeners.remove(index);
+            self.sockets.remove(listener.handle);
+        }
+    }
+
+    /// Close idle listeners until the pool is back at [`MAX_IDLE_LISTENERS`].
+    ///
+    /// [`Self::open_pending_listeners`] spares a listener whose SYN is still
+    /// queued, so a single batch of more than the cap of distinct ports can
+    /// grow the pool past it. By the time this runs the batch has been through
+    /// the stack — every SYN in it has either accepted a connection (and left
+    /// the pool) or been dropped — so anything still listening is idle and fair
+    /// game, least recently used first.
+    fn trim_idle_listeners(&mut self) {
+        while self.listeners.len() > MAX_IDLE_LISTENERS {
+            let victim = self
+                .listeners
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, listener)| listener.last_used)
+                .map(|(index, _)| index)
+                .expect("the pool is nonempty while it is above the cap");
+            let listener = self.listeners.remove(victim);
             self.sockets.remove(listener.handle);
         }
     }
@@ -376,8 +409,8 @@ impl Gateway {
     /// How many idle listening sockets the pool holds.
     ///
     /// Listeners are created on demand per destination port and reaped once the
-    /// pool reaches [`MAX_IDLE_LISTENERS`], so this stays bounded however many
-    /// ports are scanned.
+    /// pool reaches [`MAX_IDLE_LISTENERS`], and each poll trims the pool back
+    /// to that cap, so this is bounded however many ports are scanned.
     pub fn listener_count(&self) -> usize {
         self.listeners.len()
     }
@@ -798,6 +831,53 @@ mod tests {
             ports,
             "reaping never takes a listener whose SYN is already queued"
         );
+    }
+
+    /// The cap is a steady-state bound, not just a per-`add_listener` one: a
+    /// single batch of more ports than the pool holds must not leave the pool
+    /// sitting at the batch's high-water mark afterwards.
+    ///
+    /// This is the case the one-SYN-per-`poll` test cannot see. Here the batch
+    /// is of *dropped* SYNs, so no listener leaves the pool by being accepted —
+    /// every one of them is still idle when the stack is done, which is exactly
+    /// how the pool used to stay at the batch size forever.
+    #[test]
+    fn a_large_batch_of_dropped_syns_does_not_raise_the_pool_for_good() {
+        let mut g = Gateway::new(GW_ADDR, GW_PREFIX, MTU);
+        let baseline = g.socket_count();
+
+        // Three times the cap in one batch, all with a broken checksum so
+        // smoltcp drops them and the listeners stay idle.
+        let ports = MAX_IDLE_LISTENERS * 3;
+        for i in 0..ports as u16 {
+            let dst: SocketAddr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 4000 + i);
+            let mut pkt = syn(client(), dst);
+            pkt[37] ^= 0xff;
+            g.push_rx(pkt);
+        }
+        assert!(g.poll(Instant::now()).is_empty(), "all SYNs are dropped");
+
+        assert_eq!(
+            g.listener_count(),
+            MAX_IDLE_LISTENERS,
+            "the batch's high-water mark is trimmed back to the cap"
+        );
+        assert_eq!(
+            g.socket_count(),
+            baseline + MAX_IDLE_LISTENERS,
+            "and the surplus listeners' sockets are actually freed"
+        );
+
+        // A later one-port batch only swaps one out for one in, so the pool
+        // stays at the cap rather than inheriting the earlier high-water mark.
+        let dst: SocketAddr = "203.0.113.9:9999".parse().unwrap();
+        let mut pkt = syn(client(), dst);
+        pkt[37] ^= 0xff;
+        g.push_rx(pkt);
+        assert!(g.poll(Instant::now()).is_empty(), "the SYN is dropped");
+        assert_eq!(g.listener_count(), MAX_IDLE_LISTENERS, "still at the cap");
+        assert_eq!(g.socket_count(), baseline + MAX_IDLE_LISTENERS);
     }
 
     #[test]
