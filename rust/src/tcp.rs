@@ -26,7 +26,7 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp::RecvError;
+use smoltcp::socket::tcp::{self, RecvError};
 
 use crate::gateway::Gateway;
 
@@ -221,6 +221,9 @@ impl TcpSpliceEngine {
                         debug_assert!(n <= flow.to_client.len(), "send accepted more than offered");
                         flow.to_client.drain(..n);
                     }
+                    // `InvalidState` while the handshake is still completing is
+                    // not fatal either; only a reset socket is.
+                    Err(_) if gw.tcp_state(handle) != tcp::State::Closed => return,
                     Err(_) => {
                         Self::tear_down(flow, handle, ops);
                         return;
@@ -330,6 +333,13 @@ impl TcpSpliceEngine {
                         let _ = stream.shutdown(Shutdown::Write);
                     }
                     flow.client_closed = true;
+                    return;
+                }
+                Err(RecvError::InvalidState) if gw.tcp_state(handle) != tcp::State::Closed => {
+                    // The dial can win the race with the client's final ACK:
+                    // smoltcp reports `InvalidState` for the half-open
+                    // (SynReceived) socket too. Wait for the handshake rather
+                    // than resetting a connection that is still opening.
                     return;
                 }
                 Err(_) => {

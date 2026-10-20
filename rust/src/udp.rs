@@ -153,6 +153,25 @@ impl UdpForwarder {
         build_udp_reply(flow.dst, flow.client, payload)
     }
 
+    /// Build the reply for `payload` only if it fits within `mtu`.
+    ///
+    /// This is the encapsulating caller's variant of [`Self::handle_reply`]:
+    /// an inner packet larger than the tunnel MTU cannot be carried without IP
+    /// fragmentation, which this data path does not do, so it is dropped
+    /// instead of being handed to the tunnel only to be discarded there.
+    /// Returns `None` for an over-MTU reply and for payloads that
+    /// [`build_udp_reply`] cannot represent (IPv6 destinations or a length
+    /// beyond the 16-bit IPv4 total length).
+    pub fn handle_reply_within_mtu(
+        &mut self,
+        flow: FlowId,
+        payload: &[u8],
+        mtu: usize,
+    ) -> Option<Vec<u8>> {
+        let reply = self.handle_reply(flow, payload);
+        (!reply.is_empty() && reply.len() <= mtu).then_some(reply)
+    }
+
     /// Remove flows that have been idle for at least the configured timeout.
     ///
     /// `now` is expected to come from the same clock as the `Instant::now()`

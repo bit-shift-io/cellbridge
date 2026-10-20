@@ -20,6 +20,21 @@ use crate::device::QueueDevice;
 /// Receive/transmit buffer size for each TCP socket.
 const TCP_BUFFER_SIZE: usize = 8192;
 
+/// The IPv4 protocol number for UDP.
+const UDP_PROTOCOL: u8 = 17;
+
+/// How [`Gateway::route`] dispatched an inbound packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Routed {
+    /// A non-UDP IPv4 packet was queued for smoltcp (TCP, ICMP, ...).
+    Tcp,
+    /// A UDP packet was diverted from smoltcp for the caller to hand to
+    /// [`crate::UdpForwarder`].
+    Udp,
+    /// The packet was malformed or not IPv4 and was discarded.
+    Dropped,
+}
+
 /// Something the gateway wants the caller to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayEvent {
@@ -90,7 +105,33 @@ impl Gateway {
         }
     }
 
+    /// Demultiplex an inbound inner IP packet.
+    ///
+    /// UDP is diverted away from smoltcp: one socket per UDP flow cannot
+    /// preserve the client's source port, so the caller hands those packets to
+    /// [`crate::UdpForwarder`] instead. Every other well-formed IPv4 packet is
+    /// queued for the stack exactly as [`Gateway::push_rx`] does. Malformed and
+    /// non-IPv4 packets are dropped.
+    ///
+    /// The packet is consumed, so a caller that needs the bytes after a
+    /// [`Routed::Udp`] result (to pass them to the forwarder) must keep its own
+    /// copy.
+    pub fn route(&mut self, pkt: Vec<u8>) -> Routed {
+        match ipv4_protocol(&pkt) {
+            None => Routed::Dropped,
+            Some(UDP_PROTOCOL) => Routed::Udp,
+            Some(_) => {
+                self.push_rx(pkt);
+                Routed::Tcp
+            }
+        }
+    }
+
     /// Queue an inbound IP packet.
+    ///
+    /// This is the raw queueing primitive; [`Gateway::route`] is the demuxing
+    /// entry point the bridge loop uses. Both share this path, so a packet
+    /// accepted by `route` is queued identically.
     pub fn push_rx(&mut self, pkt: Vec<u8>) {
         if let Some(port) = syn_dst_port(&pkt) {
             self.pending_syns.push(port);
@@ -197,6 +238,21 @@ impl Gateway {
         self.sockets.get_mut::<tcp::Socket>(handle).send_slice(data)
     }
 
+    /// The current smoltcp state of a connection socket.
+    ///
+    /// A connection is reported as accepted as soon as its listener leaves the
+    /// `Listen` state, which happens on the SYN — before the handshake is
+    /// complete. A splice engine that dials the destination immediately can
+    /// therefore outrun the client's final ACK and must be able to tell a
+    /// half-open socket from a reset one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handle` does not refer to a socket in the set.
+    pub fn tcp_state(&self, handle: SocketHandle) -> tcp::State {
+        self.sockets.get::<tcp::Socket>(handle).state()
+    }
+
     /// Begin a graceful close of a connection socket.
     pub fn tcp_close(&mut self, handle: SocketHandle) {
         self.sockets.get_mut::<tcp::Socket>(handle).close();
@@ -232,6 +288,26 @@ impl Gateway {
     pub fn socket_count(&self) -> usize {
         self.sockets.iter().count()
     }
+}
+
+/// The protocol number of a structurally valid IPv4 packet.
+///
+/// Returns `None` for a non-IPv4 packet or one whose header and total length
+/// fields do not fit the buffer, so [`Gateway::route`] can drop it without
+/// letting smoltcp see a malformed frame.
+fn ipv4_protocol(pkt: &[u8]) -> Option<u8> {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return None;
+    }
+    let header_len = usize::from(pkt[0] & 0x0f) * 4;
+    if header_len < 20 || header_len > pkt.len() {
+        return None;
+    }
+    let total_len = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
+    if total_len < header_len || total_len > pkt.len() {
+        return None;
+    }
+    Some(pkt[9])
 }
 
 /// The destination port of an IPv4 TCP packet carrying a bare SYN, if it is one.

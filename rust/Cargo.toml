@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+# `rlib` lets the external integration tests in `tests/` link the crate; the
+# `cdylib`/`staticlib` outputs remain what Flutter and the platform build use.
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 base64 = "0.22.1"
