@@ -70,7 +70,19 @@ class CellBridgeApp extends StatefulWidget {
 }
 
 class _CellBridgeAppState extends State<CellBridgeApp> {
+  /// Pushes routes through the [MaterialApp]'s Navigator.
+  ///
+  /// This state builds the `MaterialApp`, so its own `context` sits *above*
+  /// the Navigator: `Navigator.of(context)` here throws "does not include a
+  /// Navigator". The key gives the app-level state a handle on the Navigator
+  /// it created without relying on that context.
+  final _navigatorKey = GlobalKey<NavigatorState>();
+
   bridge.BridgeConfig? _config;
+
+  /// Guards the one-shot first-launch auto-open so a rebuild can never stack a
+  /// second config screen.
+  bool _autoOpened = false;
 
   @override
   void initState() {
@@ -81,16 +93,33 @@ class _CellBridgeAppState extends State<CellBridgeApp> {
     // dashboard's "no configuration" path guides the user instead of
     // dead-ending.
     if (widget.store != null && _config == null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _openConfig());
+      WidgetsBinding.instance.addPostFrameCallback((_) => _autoOpenConfig());
     }
+  }
+
+  /// Opens the config screen on first launch, but never twice and never on top
+  /// of a route the user already opened.
+  Future<void> _autoOpenConfig() async {
+    if (_autoOpened) {
+      return;
+    }
+    _autoOpened = true;
+    final navigator = _navigatorKey.currentState;
+    // `canPop` is true once anything has been pushed on top of the dashboard,
+    // so a user who navigated during startup is not fought.
+    if (navigator == null || navigator.canPop()) {
+      return;
+    }
+    await _openConfig();
   }
 
   Future<void> _openConfig() async {
     final store = widget.store;
-    if (store == null) {
+    final navigator = _navigatorKey.currentState;
+    if (store == null || navigator == null) {
       return;
     }
-    await Navigator.of(context).push<void>(
+    await navigator.push<void>(
       MaterialPageRoute(
         builder: (_) => ConfigScreen(
           store: store,
@@ -112,6 +141,7 @@ class _CellBridgeAppState extends State<CellBridgeApp> {
     final demo = widget.demoApi;
     return MaterialApp(
       title: 'CellBridge',
+      navigatorKey: _navigatorKey,
       theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
       home: Dashboard(
         config: () => _config,
