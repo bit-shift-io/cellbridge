@@ -201,6 +201,7 @@ dependencies = [
  "bytes",
  "flutter_rust_bridge",
  "smoltcp",
+ "socket2",
  "tokio",
 ]
 

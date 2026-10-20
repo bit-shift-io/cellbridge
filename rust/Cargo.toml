@@ -14,7 +14,8 @@ boringtun = "0.7.1"
 bytes = "1.12.1"
 flutter_rust_bridge = "=2.13.0"
 smoltcp = "0.14.0"
-tokio = { version = "1.54.0", features = ["macros", "rt", "net", "io-util", "time"] }
+socket2 = "0.6.5"
+tokio = { version = "1.54.0", features = ["macros", "rt", "net", "io-util", "time", "sync"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

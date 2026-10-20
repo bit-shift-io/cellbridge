@@ -3,8 +3,36 @@
 
 // ignore_for_file: invalid_use_of_internal_member, unused_import, unnecessary_import
 
+import 'config.dart';
 import 'frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+import 'stats.dart';
+
+/// Round-trip smoke test: the Rust core replies `"pong"`.
 Future<String> ping() => RustLib.instance.api.crateApiPing();
+
+/// Start the Wi-Fi bridge.
+///
+/// `wg_socket_fd` is the WireGuard UDP socket prepared by Android and bound to
+/// the Wi-Fi network. **Ownership transfers to Rust**: the caller must detach
+/// the descriptor (`ParcelFileDescriptor.detachFd()`) and must not close it.
+/// Pass `None` to let Rust bind an ordinary UDP socket, which is how the bridge
+/// runs on a Linux desktop for development.
+///
+/// Returns an error if the bridge is already running, the configuration is
+/// invalid, or the socket cannot be bound/adopted.
+Future<void> startBridge({required BridgeConfig cfg, int? wgSocketFd}) =>
+    RustLib.instance.api.crateApiStartBridge(cfg: cfg, wgSocketFd: wgSocketFd);
+
+/// Stop the bridge and return it to [`crate::BridgeState::Idle`].
+///
+/// Safe to call when the bridge is not running.
+Future<void> stopBridge() => RustLib.instance.api.crateApiStopBridge();
+
+/// The current lifecycle state and last error, if any.
+BridgeStatus status() => RustLib.instance.api.crateApiStatus();
+
+/// The current byte and flow counters.
+Stats stats() => RustLib.instance.api.crateApiStats();
