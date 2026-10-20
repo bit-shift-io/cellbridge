@@ -11,6 +11,7 @@ import 'dart:convert';
 import 'dart:ffi' as ffi;
 
 import 'frb_generated.dart';
+import 'keys.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
 
@@ -35,6 +36,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BridgeConfig dco_decode_bridge_config(dynamic raw);
+
+  @protected
+  BridgeKeypair dco_decode_bridge_keypair(dynamic raw);
 
   @protected
   BridgeState dco_decode_bridge_state(dynamic raw);
@@ -85,6 +89,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BridgeConfig sse_decode_bridge_config(SseDeserializer deserializer);
+
+  @protected
+  BridgeKeypair sse_decode_bridge_keypair(SseDeserializer deserializer);
 
   @protected
   BridgeState sse_decode_bridge_state(SseDeserializer deserializer);
@@ -139,6 +146,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_bridge_config(BridgeConfig self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_bridge_keypair(BridgeKeypair self, SseSerializer serializer);
 
   @protected
   void sse_encode_bridge_state(BridgeState self, SseSerializer serializer);

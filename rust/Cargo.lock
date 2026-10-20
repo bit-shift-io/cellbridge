@@ -200,6 +200,7 @@ dependencies = [
  "boringtun",
  "bytes",
  "flutter_rust_bridge",
+ "getrandom",
  "smoltcp",
  "socket2",
  "tokio",

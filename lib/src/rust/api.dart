@@ -5,6 +5,7 @@
 
 import 'config.dart';
 import 'frb_generated.dart';
+import 'keys.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
@@ -36,3 +37,19 @@ BridgeStatus status() => RustLib.instance.api.crateApiStatus();
 
 /// The current byte and flow counters.
 Stats stats() => RustLib.instance.api.crateApiStats();
+
+/// Generate a WireGuard key pair using the operating system's CSPRNG.
+///
+/// Both keys are standard WireGuard base64 (32 bytes, 44 characters). The
+/// private key is clamped, matching `wg genkey`.
+Future<BridgeKeypair> generateKeypair() =>
+    RustLib.instance.api.crateApiGenerateKeypair();
+
+/// Derive the base64 public key for a base64 private key.
+///
+/// Input is clamped exactly as X25519 specifies, so a pasted `wg genkey`
+/// private key yields the same public key `wg pubkey` reports. Malformed
+/// base64 or a key that is not 32 bytes returns an error; the message never
+/// includes the key material.
+Future<String> derivePublicKey({required String privateKey}) =>
+    RustLib.instance.api.crateApiDerivePublicKey(privateKey: privateKey);

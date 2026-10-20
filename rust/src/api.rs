@@ -10,6 +10,8 @@ use crate::bridge;
 use crate::config::BridgeConfig;
 use crate::stats::{BridgeStatus, Stats};
 
+pub use crate::keys::BridgeKeypair;
+
 /// Round-trip smoke test: the Rust core replies `"pong"`.
 pub fn ping() -> String {
     "pong".to_string()
@@ -47,4 +49,22 @@ pub fn status() -> BridgeStatus {
 #[frb(sync)]
 pub fn stats() -> Stats {
     bridge::stats()
+}
+
+/// Generate a WireGuard key pair using the operating system's CSPRNG.
+///
+/// Both keys are standard WireGuard base64 (32 bytes, 44 characters). The
+/// private key is clamped, matching `wg genkey`.
+pub fn generate_keypair() -> BridgeKeypair {
+    crate::keys::generate()
+}
+
+/// Derive the base64 public key for a base64 private key.
+///
+/// Input is clamped exactly as X25519 specifies, so a pasted `wg genkey`
+/// private key yields the same public key `wg pubkey` reports. Malformed
+/// base64 or a key that is not 32 bytes returns an error; the message never
+/// includes the key material.
+pub fn derive_public_key(private_key: String) -> Result<String, String> {
+    crate::keys::derive_public(&private_key)
 }

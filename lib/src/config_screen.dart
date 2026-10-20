@@ -1,6 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'bridge.dart';
+import 'keys.dart';
 import 'settings_store.dart';
 
 /// A form over [BridgeConfig].
@@ -16,6 +20,7 @@ class ConfigScreen extends StatefulWidget {
     this.initialConfig,
     required this.bridgeRunning,
     this.onSaved,
+    this.keyApi,
   });
 
   /// Where a validated configuration is written.
@@ -31,6 +36,10 @@ class ConfigScreen extends StatefulWidget {
   /// Called with the saved configuration after a successful write.
   final ValueChanged<BridgeConfig>? onSaved;
 
+  /// Key operations. Defaults to the process-wide [keyApi]; widget tests inject
+  /// a fake so they never need the Rust library.
+  final KeyApi? keyApi;
+
   @override
   State<ConfigScreen> createState() => _ConfigScreenState();
 }
@@ -45,7 +54,28 @@ class _ConfigScreenState extends State<ConfigScreen> {
   late final TextEditingController _endpoint;
   late final TextEditingController _mtu;
 
+  /// Read-only display of the key derived from [_privateKey].
+  late final TextEditingController _publicKey;
+
+  static const _hintEmpty =
+      'Generate or paste a private key to show its public key.';
+  static const _hintInvalid =
+      'Enter a valid private key to see its public key.';
+  static const _hintDeriving = 'Deriving public key…';
+  static const _hintReady = 'Add this as the peer on your router.';
+
+  String _publicKeyHint = _hintEmpty;
+
+  Timer? _deriveDebounce;
+  int _deriveRequest = 0;
+
+  /// Guards the controller listener while [_generateKeypair] fills the field,
+  /// so generating does not schedule a redundant derivation.
+  bool _suppressPrivateKeyListener = false;
+
   bool _saving = false;
+
+  KeyApi get _keys => widget.keyApi ?? keyApi;
 
   @override
   void initState() {
@@ -57,17 +87,134 @@ class _ConfigScreenState extends State<ConfigScreen> {
     _presharedKey = TextEditingController(text: config?.presharedKey ?? '');
     _endpoint = TextEditingController(text: config?.endpoint ?? '');
     _mtu = TextEditingController(text: config == null ? '' : '${config.mtu}');
+    _publicKey = TextEditingController();
+
+    _privateKey.addListener(_onPrivateKeyChanged);
+    final initialPrivateKey = _privateKey.text.trim();
+    if (initialPrivateKey.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _derivePublicKey(initialPrivateKey),
+      );
+    }
   }
 
   @override
   void dispose() {
+    _deriveDebounce?.cancel();
     _privateKey.dispose();
     _address.dispose();
     _peerPublicKey.dispose();
     _presharedKey.dispose();
     _endpoint.dispose();
     _mtu.dispose();
+    _publicKey.dispose();
     super.dispose();
+  }
+
+  /// Debounced derivation while the user types or pastes a private key.
+  void _onPrivateKeyChanged() {
+    if (_suppressPrivateKeyListener) {
+      return;
+    }
+    _deriveDebounce?.cancel();
+    final value = _privateKey.text.trim();
+    if (value.isEmpty) {
+      _clearPublicKey(_hintEmpty);
+      return;
+    }
+    if (validatePrivateKey(value) != null) {
+      // Shape-invalid text is not an error here: the form validator already
+      // owns that, and red error text while typing would be hostile.
+      _clearPublicKey(_hintInvalid);
+      return;
+    }
+    setState(() => _publicKeyHint = _hintDeriving);
+    _deriveDebounce = Timer(
+      const Duration(milliseconds: 300),
+      () => _derivePublicKey(value),
+    );
+  }
+
+  void _clearPublicKey(String hint) {
+    _deriveRequest++;
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _publicKey.clear();
+      _publicKeyHint = hint;
+    });
+  }
+
+  /// Derives and displays the public key for [privateKey].
+  ///
+  /// A malformed key (shape-valid but not canonical base64, or the wrong
+  /// length) falls back to the neutral hint; nothing here is a form error.
+  Future<void> _derivePublicKey(String privateKey) async {
+    if (!mounted) {
+      return;
+    }
+    final value = privateKey.trim();
+    if (validatePrivateKey(value) != null) {
+      _clearPublicKey(_hintInvalid);
+      return;
+    }
+
+    final request = ++_deriveRequest;
+    setState(() => _publicKeyHint = _hintDeriving);
+    try {
+      final publicKey = await _keys.derive(value);
+      if (!mounted || request != _deriveRequest) {
+        return;
+      }
+      setState(() {
+        _publicKey.text = publicKey;
+        _publicKeyHint = _hintReady;
+      });
+    } catch (_) {
+      if (!mounted || request != _deriveRequest) {
+        return;
+      }
+      setState(() {
+        _publicKey.clear();
+        _publicKeyHint = _hintInvalid;
+      });
+    }
+  }
+
+  Future<void> _generateKeypair() async {
+    try {
+      final pair = await _keys.generate();
+      if (!mounted) {
+        return;
+      }
+      _deriveDebounce?.cancel();
+      _deriveRequest++;
+      setState(() {
+        _suppressPrivateKeyListener = true;
+        _privateKey.text = pair.privateKey;
+        _suppressPrivateKeyListener = false;
+        _publicKey.text = pair.publicKey;
+        _publicKeyHint = _hintReady;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      _showMessage('Could not generate a key pair. Please try again.');
+    }
+  }
+
+  Future<void> _copyPublicKey() async {
+    final publicKey = _publicKey.text;
+    if (publicKey.isEmpty) {
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: publicKey));
+    if (!mounted) {
+      return;
+    }
+    _showMessage('Phone public key copied.');
   }
 
   Future<void> _save() async {
@@ -79,6 +226,14 @@ class _ConfigScreenState extends State<ConfigScreen> {
     }
 
     if (!(_formKey.currentState?.validate() ?? false)) {
+      return;
+    }
+
+    // Refresh the displayed public key on save, in case the user typed and hit
+    // Save before the debounce fired.
+    _deriveDebounce?.cancel();
+    await _derivePublicKey(_privateKey.text.trim());
+    if (!mounted) {
       return;
     }
 
@@ -128,96 +283,136 @@ class _ConfigScreenState extends State<ConfigScreen> {
       appBar: AppBar(title: const Text('Configuration')),
       body: Form(
         key: _formKey,
-        child: ListView(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(16),
-          children: [
-            TextFormField(
-              key: const Key('config-private-key'),
-              controller: _privateKey,
-              obscureText: true,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: 'Private key',
-                helperText: 'Base64 WireGuard private key',
-              ),
-              validator: (value) => validatePrivateKey(value ?? ''),
-            ),
-            TextFormField(
-              key: const Key('config-address'),
-              controller: _address,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: 'Address',
-                helperText: 'Interface address in CIDR form',
-              ),
-              validator: (value) => validateAddress(value ?? ''),
-            ),
-            TextFormField(
-              key: const Key('config-peer-public-key'),
-              controller: _peerPublicKey,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: 'Peer public key',
-                helperText: 'Base64 WireGuard public key of the LAN exit peer',
-              ),
-              validator: (value) => validatePeerPublicKey(value ?? ''),
-            ),
-            TextFormField(
-              key: const Key('config-preshared-key'),
-              controller: _presharedKey,
-              obscureText: true,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: 'Preshared key (optional)',
-                helperText: 'Base64 WireGuard preshared key',
-              ),
-              validator: validatePresharedKey,
-            ),
-            TextFormField(
-              key: const Key('config-endpoint'),
-              controller: _endpoint,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: 'Endpoint',
-                helperText: 'host:port, e.g. 203.0.113.1:51820',
-              ),
-              validator: (value) => validateEndpoint(value ?? ''),
-            ),
-            TextFormField(
-              key: const Key('config-mtu'),
-              controller: _mtu,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'MTU',
-                helperText: 'Between $minMtu and $maxMtu',
-              ),
-              validator: (value) => validateMtu(value ?? ''),
-            ),
-            const SizedBox(height: 24),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                TextButton(
-                  key: const Key('config-cancel'),
-                  onPressed: _saving
-                      ? null
-                      : () => Navigator.of(context).maybePop(),
-                  child: const Text('Cancel'),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextFormField(
+                key: const Key('config-private-key'),
+                controller: _privateKey,
+                obscureText: true,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: const InputDecoration(
+                  labelText: 'Private key',
+                  helperText: 'Base64 WireGuard private key',
                 ),
-                const SizedBox(width: 12),
-                FilledButton(
-                  key: const Key('config-save'),
-                  onPressed: _saving ? null : _save,
-                  child: const Text('Save'),
+                validator: (value) => validatePrivateKey(value ?? ''),
+              ),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: OutlinedButton.icon(
+                  key: const Key('config-generate-keypair'),
+                  onPressed: _saving ? null : _generateKeypair,
+                  icon: const Icon(Icons.vpn_key_outlined),
+                  label: const Text('Generate key pair'),
                 ),
-              ],
-            ),
-          ],
+              ),
+              const SizedBox(height: 8),
+              TextFormField(
+                key: const Key('config-public-key'),
+                controller: _publicKey,
+                readOnly: true,
+                enableInteractiveSelection: true,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: 'Phone public key',
+                  helperText: _publicKeyHint,
+                  helperMaxLines: 2,
+                  hintText: 'No public key yet',
+                  suffixIcon: IconButton(
+                    key: const Key('config-copy-public-key'),
+                    tooltip: 'Copy phone public key',
+                    onPressed: _publicKey.text.isEmpty ? null : _copyPublicKey,
+                    icon: const Icon(Icons.copy),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextFormField(
+                key: const Key('config-address'),
+                controller: _address,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: const InputDecoration(
+                  labelText: 'Address',
+                  helperText: 'Interface address in CIDR form',
+                ),
+                validator: (value) => validateAddress(value ?? ''),
+              ),
+              TextFormField(
+                key: const Key('config-peer-public-key'),
+                controller: _peerPublicKey,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: const InputDecoration(
+                  labelText: 'Peer public key',
+                  helperText:
+                      'Base64 WireGuard public key of the LAN exit peer',
+                ),
+                validator: (value) => validatePeerPublicKey(value ?? ''),
+              ),
+              TextFormField(
+                key: const Key('config-preshared-key'),
+                controller: _presharedKey,
+                obscureText: true,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: const InputDecoration(
+                  labelText: 'Preshared key (optional)',
+                  helperText: 'Base64 WireGuard preshared key',
+                ),
+                validator: validatePresharedKey,
+              ),
+              TextFormField(
+                key: const Key('config-endpoint'),
+                controller: _endpoint,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: const InputDecoration(
+                  labelText: 'Endpoint',
+                  helperText: 'host:port, e.g. 203.0.113.1:51820',
+                ),
+                validator: (value) => validateEndpoint(value ?? ''),
+              ),
+              TextFormField(
+                key: const Key('config-mtu'),
+                controller: _mtu,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'MTU',
+                  helperText: 'Between $minMtu and $maxMtu',
+                ),
+                validator: (value) => validateMtu(value ?? ''),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                key: const Key('config-cancel'),
+                onPressed: _saving
+                    ? null
+                    : () => Navigator.of(context).maybePop(),
+                child: const Text('Cancel'),
+              ),
+              const SizedBox(width: 12),
+              FilledButton(
+                key: const Key('config-save'),
+                onPressed: _saving ? null : _save,
+                child: const Text('Save'),
+              ),
+            ],
+          ),
         ),
       ),
     );

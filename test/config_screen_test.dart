@@ -3,11 +3,20 @@
 // Every test injects an in-memory [SettingsBackend]; nothing here touches a
 // MethodChannel or the real application-support directory.
 
+import 'dart:convert';
+
 import 'package:cellbridge/src/bridge.dart';
 import 'package:cellbridge/src/config_screen.dart';
+import 'package:cellbridge/src/keys.dart';
 import 'package:cellbridge/src/settings_store.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+/// RFC 7748 §6.1 (Alice's key pair), base64 of the raw bytes. Not a project
+/// key: the same vector is asserted in `rust/tests/keys.rs`.
+const _rfcPrivateKey = 'dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=';
+const _rfcPublicKey = 'hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=';
 
 /// Base64-shaped 32-byte WireGuard keys. The value is irrelevant here; only
 /// the shape matters to validation.
@@ -40,12 +49,40 @@ class _MemoryBackend implements SettingsBackend {
 SettingsStore _storeOn(_MemoryBackend backend) =>
     SettingsStore(backend: backend);
 
+/// Stand-in for the Rust key functions.
+class _FakeKeyApi implements KeyApi {
+  _FakeKeyApi({this.pair, Map<String, String>? derivations})
+    : derivations = derivations ?? const {};
+
+  final BridgeKeypair? pair;
+  final Map<String, String> derivations;
+  int generateCalls = 0;
+  final List<String> deriveCalls = [];
+
+  @override
+  Future<BridgeKeypair> generate() async {
+    generateCalls++;
+    return pair!;
+  }
+
+  @override
+  Future<String> derive(String privateKey) async {
+    deriveCalls.add(privateKey);
+    final publicKey = derivations[privateKey];
+    if (publicKey == null) {
+      throw const FormatException('unrecognised test key');
+    }
+    return publicKey;
+  }
+}
+
 Future<void> _pumpScreen(
   WidgetTester tester, {
   required SettingsStore store,
   BridgeConfig? initialConfig,
   bool running = false,
   ValueChanged<BridgeConfig>? onSaved,
+  KeyApi? keyApi,
 }) async {
   await tester.pumpWidget(
     MaterialApp(
@@ -54,6 +91,7 @@ Future<void> _pumpScreen(
         initialConfig: initialConfig,
         bridgeRunning: () => running,
         onSaved: onSaved,
+        keyApi: keyApi,
       ),
     ),
   );
@@ -72,7 +110,6 @@ Finder _messagesContaining(String text) => find.byWidgetPredicate(
 );
 
 Future<void> _save(WidgetTester tester) async {
-  await tester.ensureVisible(find.byKey(const Key('config-save')));
   await tester.tap(find.byKey(const Key('config-save')));
   await tester.pumpAndSettle();
 }
@@ -298,6 +335,123 @@ void main() {
 
       expect(find.textContaining('Could not save'), findsOneWidget);
       expect(_messagesContaining(_privateKey), findsNothing);
+    });
+
+    testWidgets('generating fills the private key and shows its public key', (
+      tester,
+    ) async {
+      final generatedPrivate = base64Encode(List<int>.filled(32, 7));
+      final generatedPublic = base64Encode(List<int>.filled(32, 9));
+      final keys = _FakeKeyApi(
+        pair: BridgeKeypair(
+          privateKey: generatedPrivate,
+          publicKey: generatedPublic,
+        ),
+      );
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        keyApi: keys,
+      );
+
+      await tester.tap(find.byKey(const Key('config-generate-keypair')));
+      await tester.pumpAndSettle();
+
+      expect(keys.generateCalls, 1);
+      expect(_field(tester, 'config-private-key'), generatedPrivate);
+      expect(_field(tester, 'config-public-key'), generatedPublic);
+      expect(find.textContaining('Phone public key'), findsWidgets);
+      expect(find.textContaining('Add this as the peer'), findsOneWidget);
+      // The private key is not rendered as a message, only in its obscured
+      // input field.
+      expect(_messagesContaining(generatedPrivate), findsNothing);
+    });
+
+    testWidgets('pasting a valid private key derives the RFC public key', (
+      tester,
+    ) async {
+      final keys = _FakeKeyApi(derivations: {_rfcPrivateKey: _rfcPublicKey});
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        keyApi: keys,
+      );
+
+      await tester.enterText(
+        find.byKey(const Key('config-private-key')),
+        _rfcPrivateKey,
+      );
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pumpAndSettle();
+
+      expect(keys.deriveCalls, contains(_rfcPrivateKey));
+      expect(_field(tester, 'config-public-key'), _rfcPublicKey);
+    });
+
+    testWidgets('a malformed private key shows a neutral hint, not an error', (
+      tester,
+    ) async {
+      final keys = _FakeKeyApi();
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        keyApi: keys,
+      );
+
+      await tester.enterText(
+        find.byKey(const Key('config-private-key')),
+        'not-a-key',
+      );
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('Enter a valid private key to see its public key.'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('must be a base64'), findsNothing);
+      expect(keys.deriveCalls, isEmpty);
+    });
+
+    testWidgets('copying the public key writes it to the clipboard', (
+      tester,
+    ) async {
+      final calls = <MethodCall>[];
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+        calls.add(call);
+        return null;
+      });
+      addTearDown(
+        () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+      );
+
+      final keys = _FakeKeyApi(derivations: {_rfcPrivateKey: _rfcPublicKey});
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        keyApi: keys,
+      );
+
+      await tester.enterText(
+        find.byKey(const Key('config-private-key')),
+        _rfcPrivateKey,
+      );
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('config-copy-public-key')));
+      await tester.pump();
+
+      final clipboardCall = calls.firstWhere(
+        (call) => call.method == 'Clipboard.setData',
+      );
+      expect(
+        (clipboardCall.arguments as Map<Object?, Object?>)['text'],
+        _rfcPublicKey,
+      );
+      expect(find.text('Phone public key copied.'), findsOneWidget);
     });
   });
 }
