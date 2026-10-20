@@ -44,6 +44,20 @@ Because the phone originates the connections itself, **no root is required** and
 * `router/` — OpenWrt (Flint 3) setup and revert scripts.
 * `docs/` — the design spec and implementation plan.
 
+## Run the dashboard on Linux (no phone required)
+
+The dashboard runs against a simulated backend, so UI work needs neither an
+Android device nor a router:
+
+```sh
+flutter run -d linux --dart-define=CELLBRIDGE_DEMO=true
+```
+
+The demo shows `Connecting` for about 1.5 seconds, then `Connected` with
+counters and active flows that keep changing. Use the bug icon in the app bar
+to simulate losing the uplink and see the error state. Without the
+`CELLBRIDGE_DEMO` define the app initializes the real Rust bridge instead.
+
 ## Hardware
 
 * **Router:** GL.iNet GL-BE9300 (Flint 3), stock firmware, SSH access.

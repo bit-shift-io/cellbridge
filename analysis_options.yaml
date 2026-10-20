@@ -16,6 +16,7 @@ analyzer:
     # Vendored Cargokit build tool shipped by `flutter_rust_bridge_codegen
     # integrate`; it is not part of this package's sources.
     - rust_builder/**
+    - linux/**
 
 linter:
   # The lint rules applied to this project can be customized in the

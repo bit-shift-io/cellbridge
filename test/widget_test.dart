@@ -1,34 +1,62 @@
-// Smoke test for the CellBridge shell and the Rust round-trip wiring.
-//
-// The Rust library itself is not loaded here; the ping result is injected so
-// the widget tree can be exercised without FFI.
+// Smoke tests for the app shell, switching the bridge seam to fakes so no
+// Rust library or Android device is needed.
 
-import 'dart:async';
-
+import 'package:cellbridge/main.dart';
+import 'package:cellbridge/src/bridge.dart';
+import 'package:cellbridge/src/demo_bridge.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:cellbridge/main.dart';
+class _IdleBridgeApi implements BridgeApi {
+  @override
+  Future<void> start(BridgeConfig config) async {}
+
+  @override
+  Future<void> stop() async {}
+
+  @override
+  BridgeStatus status() => const BridgeStatus(state: BridgeState.idle);
+
+  @override
+  Stats stats() => Stats(
+    txBytes: BigInt.zero,
+    rxBytes: BigInt.zero,
+    activeFlows: BigInt.zero,
+  );
+}
 
 void main() {
-  testWidgets('renders the ping round-trip result', (WidgetTester tester) async {
-    await tester.pumpWidget(CellBridgeApp(ping: Future.value('pong')));
+  testWidgets('renders the dashboard', (tester) async {
+    final original = bridgeApi;
+    bridgeApi = _IdleBridgeApi();
+    addTearDown(() => bridgeApi = original);
 
-    // While the future is pending a spinner is shown.
-    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    await tester.pumpWidget(const CellBridgeApp());
 
-    // Once it resolves the Rust reply is displayed.
-    await tester.pump();
-    expect(find.text('pong'), findsOneWidget);
-    expect(find.byType(CircularProgressIndicator), findsNothing);
+    expect(find.text('CellBridge'), findsOneWidget);
+    expect(find.byKey(const Key('connect-toggle')), findsOneWidget);
+    expect(find.byKey(const Key('status-text')), findsOneWidget);
   });
 
-  testWidgets('surfaces bridge errors', (WidgetTester tester) async {
-    final completer = Completer<String>();
-    await tester.pumpWidget(CellBridgeApp(ping: completer.future));
+  testWidgets('demo mode connects and reaches the error UI', (tester) async {
+    final api = DemoBridgeApi();
+    final original = bridgeApi;
+    bridgeApi = api;
+    addTearDown(() async {
+      await api.stop();
+      bridgeApi = original;
+    });
 
-    completer.completeError('boom');
+    await tester.pumpWidget(CellBridgeApp(demoApi: api));
+    await tester.tap(find.byKey(const Key('connect-toggle')));
     await tester.pump();
-    expect(find.textContaining('boom'), findsOneWidget);
+    expect(find.text('Connecting'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 1600));
+    expect(find.text('Connected'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('simulate-error')));
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(find.byKey(const Key('last-error')), findsOneWidget);
   });
 }
