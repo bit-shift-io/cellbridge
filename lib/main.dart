@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 
 import 'src/bridge.dart' as bridge;
 import 'src/config_screen.dart';
 import 'src/dashboard.dart';
 import 'src/demo_bridge.dart';
 import 'src/settings_store.dart';
+import 'src/android_bridge.dart';
+import 'src/diagnostics_screen.dart';
 
 /// Runs the dashboard against the simulated backend on desktop:
 ///
@@ -33,6 +36,11 @@ Future<void> main() async {
     config = _demoConfig;
   } else {
     await bridge.initBridge();
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      final api = AndroidBridgeApi();
+      await api.initialize();
+      bridge.bridgeApi = api;
+    }
     store = SettingsStore(backend: createSettingsBackend());
     try {
       config = await store.load();
@@ -146,6 +154,14 @@ class _CellBridgeAppState extends State<CellBridgeApp> {
       home: Dashboard(
         config: () => _config,
         actions: [
+          if (bridge.bridgeApi case final AndroidBridgeApi api)
+            IconButton(
+              tooltip: 'Diagnostics',
+              icon: const Icon(Icons.monitor_heart_outlined),
+              onPressed: () => _navigatorKey.currentState?.push<void>(
+                MaterialPageRoute(builder: (_) => DiagnosticsScreen(api: api)),
+              ),
+            ),
           if (widget.store != null)
             IconButton(
               key: const Key('open-config'),

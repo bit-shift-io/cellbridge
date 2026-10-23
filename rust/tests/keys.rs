@@ -103,7 +103,9 @@ fn never_panics_on_arbitrary_input() {
 
     let mut state: u64 = 0x2545_f491_4f6c_dd1d;
     for _ in 0..256 {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let len = (state % 96) as usize;
         let text: String = (0..len)
             .map(|_| {

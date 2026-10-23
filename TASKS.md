@@ -18,8 +18,8 @@ This file tracks progress only.
 ## Phase B — Android platform layer
 
 - [ ] Task 9: Kotlin `NetworkBinder`
-- [ ] Task 10: `BridgeService` + boot receiver
-- [ ] Task 11: FRB lifecycle wiring
+- [x] Task 10: `BridgeService` + boot receiver (build/unit verified; device pending)
+- [x] Task 11: Native Rust lifecycle wiring via JNI; Flutter service controls
 
 ## Phase C — Flutter UI
 
@@ -31,5 +31,8 @@ This file tracks progress only.
 - [ ] Task 14: Router setup + revert scripts
 
 ## Phase E — Verification
+
+- [x] Maintained Fedora stand-in router and host production-loop checks
+- [ ] Physical-device pre-router verification — see `docs/testing/pre-router-verification.md`
 
 - [ ] Task 15: On-device end-to-end, throughput, boot, soak

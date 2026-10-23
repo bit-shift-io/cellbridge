@@ -105,7 +105,11 @@ impl Shared {
     }
 
     fn set_status(&self, status: BridgeStatus) {
-        *lock(&self.status) = status;
+        let mut current = lock(&self.status);
+        if *current != status {
+            crate::diagnostics::record("bridge", &format!("{:?}", status.state));
+        }
+        *current = status;
     }
 }
 
@@ -170,6 +174,11 @@ pub fn stats() -> Stats {
 /// descriptor bound to a specific interface address, or one that is already
 /// connected, from tripping a hard `connect` error at startup.
 pub async fn start(cfg: BridgeConfig, wg_socket_fd: Option<i32>) -> Result<(), String> {
+    // Ownership transfers even when validation or the duplicate check fails.
+    let adopted = wg_socket_fd
+        .map(adopt_socket)
+        .transpose()
+        .map_err(|err| format!("cannot adopt WireGuard socket: {err}"))?;
     let _lifecycle = LIFECYCLE.lock().await;
     if is_running() {
         return Err("the bridge is already running".to_string());
@@ -178,15 +187,14 @@ pub async fn start(cfg: BridgeConfig, wg_socket_fd: Option<i32>) -> Result<(), S
     let endpoint: SocketAddr = cfg
         .endpoint
         .parse()
-        .map_err(|err| format!("invalid endpoint `{}`: {err}", cfg.endpoint))?;
+        .map_err(|_| "invalid endpoint: expected numeric IP:port".to_string())?;
     let (address, prefix_len) = parse_address(&cfg.address)?;
 
     // Build everything fallible before touching the shared status, so a bad
     // configuration leaves the app in `Idle` rather than a stuck `Connecting`.
     let tunnel = Tunnel::new(&cfg).map_err(|err| err.to_string())?;
-    let std_socket = match wg_socket_fd {
-        Some(fd) => adopt_socket(fd)
-            .map_err(|err| format!("cannot adopt WireGuard socket fd {fd}: {err}"))?,
+    let std_socket = match adopted {
+        Some(socket) => socket,
         None => bind_tunnel_socket(endpoint)
             .map_err(|err| format!("cannot bind the WireGuard socket: {err}"))?,
     };

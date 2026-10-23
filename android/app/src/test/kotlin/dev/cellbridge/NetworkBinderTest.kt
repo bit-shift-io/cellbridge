@@ -77,6 +77,18 @@ class NetworkBinderTest {
     }
 
     @Test
+    fun keeper_requests_internet_and_selection_rejects_noninternet_cellular_network() {
+        val field = NetworkBinder::class.java.getDeclaredField("cellularRequest").apply { isAccessible = true }
+        val request = field.get(binder) as android.net.NetworkRequest
+        assertTrue(request.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET))
+        val caps = cm.getNetworkCapabilities(cellular)!!
+        shadowOf(caps).removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        shadowOf(cm).setNetworkCapabilities(cellular, caps)
+        assertNull(binder.cellularNetwork())
+        assertSame(wifi, binder.wifiNetwork()) // LAN Wi-Fi need not have internet.
+    }
+
+    @Test
     fun wifiNetwork_selects_the_wifi_network() {
         assertSame(wifi, binder.wifiNetwork())
     }
@@ -337,6 +349,9 @@ class NetworkBinderTest {
         if (transport != null) {
             val capabilities = ShadowNetworkCapabilities.newInstance()
             shadowOf(capabilities).addTransportType(transport)
+            if (transport == NetworkCapabilities.TRANSPORT_CELLULAR) {
+                shadowOf(capabilities).addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            }
             shadow.setNetworkCapabilities(network, capabilities)
         }
         return network

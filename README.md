@@ -8,7 +8,8 @@ It replaces the usual "phone hotspot → second router → Flint 3 WAN" chain wi
 app. The router routes the LAN's internet traffic into a **WireGuard** pipe to the phone;
 the phone re-originates it on its cellular radio.
 
-> **Status:** design and implementation plan complete; implementation not started.
+> **Status:** Rust bridge, Android native service, UI and pre-router test tools
+> implemented; physical-device and router-cutover verification pending.
 > See [`docs/superpowers/specs/2026-10-20-cellbridge-design.md`](docs/superpowers/specs/2026-10-20-cellbridge-design.md)
 > and [`docs/superpowers/plans/2026-10-20-cellbridge.md`](docs/superpowers/plans/2026-10-20-cellbridge.md).
 
@@ -57,6 +58,16 @@ The demo shows `Connecting` for about 1.5 seconds, then `Connected` with
 counters and active flows that keep changing. Use the bug icon in the app bar
 to simulate losing the uplink and see the error state. Without the
 `CELLBRIDGE_DEMO` define the app initializes the real Rust bridge instead.
+
+## Test before changing the router
+
+The maintained `standin_router` Rust binary runs on Fedora using normal UDP
+sockets. It exercises the real phone service with TCP, UDP and DNS checks without
+changing Fedora routes or configuring Flint 3. The Android service owns the Rust
+bridge independently of Flutter; the UI displays its state and diagnostics.
+
+See [the pre-router verification runbook](docs/testing/pre-router-verification.md)
+for builds, key exchange, USB-tether preparation and staged device checks.
 
 ## Hardware
 

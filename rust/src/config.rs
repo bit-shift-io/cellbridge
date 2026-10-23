@@ -5,7 +5,8 @@
 //! `start_bridge`, so it holds no lifetimes and borrows nothing.
 
 /// Everything needed to bring up a WireGuard exit bridge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BridgeConfig {
     /// Base64-encoded WireGuard private key of this device.
     pub private_key: String,

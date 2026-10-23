@@ -3,6 +3,8 @@ package dev.cellbridge.cellbridge
 import dev.cellbridge.ConfigStoreHandler
 import dev.cellbridge.EncryptedConfigStore
 import dev.cellbridge.SETTINGS_CHANNEL
+import dev.cellbridge.BRIDGE_CHANNEL
+import dev.cellbridge.BridgeChannel
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -19,6 +21,8 @@ class MainActivity : FlutterActivity() {
      */
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, BRIDGE_CHANNEL)
+            .setMethodCallHandler(BridgeChannel(this))
 
         val store = EncryptedConfigStore(applicationContext)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SETTINGS_CHANNEL)

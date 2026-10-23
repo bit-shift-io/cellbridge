@@ -105,6 +105,7 @@ class NetworkBinder(
     private val cellularRequest: NetworkRequest =
         NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
 
     /**
@@ -185,9 +186,7 @@ class NetworkBinder(
      * Bind the process to [cellular], so sockets Rust opens afterwards default to
      * the cellular network. Call this before the bridge starts.
      */
-    fun bindProcess(cellular: Network) {
-        cm.bindProcessToNetwork(cellular)
-    }
+    fun bindProcess(cellular: Network): Boolean = cm.bindProcessToNetwork(cellular)
 
     /**
      * Create a UDP socket bound to [network] (Wi-Fi) and hand its descriptor to
@@ -218,9 +217,13 @@ class NetworkBinder(
     fun bindWifiSocket(network: Network): Int {
         val socket = DatagramSocket()
         // Pin before anything else can use the socket.
-        network.bindSocket(socket)
-
-        val fd = detachDescriptor(socket)
+        val fd = try {
+            network.bindSocket(socket)
+            detachDescriptor(socket)
+        } catch (e: Exception) {
+            socket.close()
+            throw e
+        }
         // Ownership of `fd` now belongs to Rust.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             socket.close()
@@ -276,7 +279,9 @@ class NetworkBinder(
     @Suppress("DEPRECATION")
     private fun networkUsing(transport: Int): Network? =
         cm.allNetworks.firstOrNull { network ->
-            cm.getNetworkCapabilities(network)?.hasTransport(transport) == true
+            val caps = cm.getNetworkCapabilities(network)
+            caps?.hasTransport(transport) == true && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                (transport != NetworkCapabilities.TRANSPORT_CELLULAR || caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET))
         }
 
     /** Fire the listener for each [transports] entry we report on. */

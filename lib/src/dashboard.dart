@@ -41,6 +41,7 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
   );
 
   Timer? _pollTimer;
+  Listenable? _serviceUpdates;
   bool _busy = false;
   String? _actionError;
 
@@ -65,6 +66,11 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _status = bridgeApi.status();
     _stats = bridgeApi.stats();
+    final api = bridgeApi;
+    if (api is Listenable) {
+      _serviceUpdates = api as Listenable;
+      _serviceUpdates!.addListener(_onServiceUpdate);
+    }
     _syncPolling();
   }
 
@@ -98,10 +104,17 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _serviceUpdates?.removeListener(_onServiceUpdate);
     _pollTimer?.cancel();
     _tickerMode?.removeListener(_onTickerVisibilityChanged);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  void _onServiceUpdate() {
+    if (!mounted) return;
+    setState(_readNow);
+    _syncPolling();
   }
 
   /// Keeps the timer running only while visible and not idle.
