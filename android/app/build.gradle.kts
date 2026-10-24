@@ -5,6 +5,7 @@ plugins {
 }
 
 android {
+    buildFeatures { buildConfig = true }
     namespace = "dev.cellbridge.cellbridge"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
@@ -43,6 +44,9 @@ dependencies {
     // EncryptedSharedPreferences, so the WireGuard private key is not readable at
     // rest. There is deliberately no plaintext SharedPreferences fallback.
     implementation("androidx.security:security-crypto:1.1.0")
+    // Tink's compile-time annotations are referenced during release shrinking.
+    compileOnly("com.google.errorprone:error_prone_annotations:2.36.0")
+    compileOnly("com.google.code.findbugs:jsr305:3.0.2")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.17")

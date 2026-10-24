@@ -21,6 +21,7 @@ class ConfigScreen extends StatefulWidget {
     required this.bridgeRunning,
     this.onSaved,
     this.keyApi,
+    this.testConnection,
   });
 
   /// Where a validated configuration is written.
@@ -39,6 +40,7 @@ class ConfigScreen extends StatefulWidget {
   /// Key operations. Defaults to the process-wide [keyApi]; widget tests inject
   /// a fake so they never need the Rust library.
   final KeyApi? keyApi;
+  final Future<void> Function(BridgeConfig)? testConnection;
 
   @override
   State<ConfigScreen> createState() => _ConfigScreenState();
@@ -74,6 +76,54 @@ class _ConfigScreenState extends State<ConfigScreen> {
   bool _suppressPrivateKeyListener = false;
 
   bool _saving = false;
+  bool _testing = false;
+  String? _testResult;
+  int _testRevision = 0;
+
+  void _invalidateTestResult() {
+    _testRevision++;
+    if (mounted && _testResult != null) setState(() => _testResult = null);
+  }
+
+  Future<void> _testConnection() async {
+    if (widget.bridgeRunning()) {
+      _showMessage('Disconnect the bridge before testing the connection.');
+      return;
+    }
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+    final config = BridgeConfig(
+      privateKey: _privateKey.text.trim(),
+      address: _address.text.trim(),
+      peerPublicKey: _peerPublicKey.text.trim(),
+      endpoint: _endpoint.text.trim(),
+      mtu: int.parse(_mtu.text.trim()),
+      presharedKey: _presharedKey.text.trim().isEmpty
+          ? null
+          : _presharedKey.text.trim(),
+    );
+    setState(() {
+      _testing = true;
+      _testResult = null;
+    });
+    final testedRevision = _testRevision;
+    try {
+      await widget.testConnection!(config);
+      if (mounted && testedRevision == _testRevision) {
+        setState(
+          () => _testResult =
+              'Authenticated WireGuard handshake succeeded over Wi-Fi.',
+        );
+      }
+    } catch (_) {
+      if (mounted && testedRevision == _testRevision) {
+        setState(
+          () => _testResult = 'Wi-Fi connection test failed. Check Wi-Fi, endpoint and paired keys.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _testing = false);
+    }
+  }
 
   KeyApi get _keys => widget.keyApi ?? keyApi;
 
@@ -88,6 +138,16 @@ class _ConfigScreenState extends State<ConfigScreen> {
     _endpoint = TextEditingController(text: config?.endpoint ?? '');
     _mtu = TextEditingController(text: config == null ? '' : '${config.mtu}');
     _publicKey = TextEditingController();
+    for (final field in [
+      _privateKey,
+      _address,
+      _peerPublicKey,
+      _presharedKey,
+      _endpoint,
+      _mtu,
+    ]) {
+      field.addListener(_invalidateTestResult);
+    }
 
     _privateKey.addListener(_onPrivateKeyChanged);
     final initialPrivateKey = _privateKey.text.trim();
@@ -388,6 +448,22 @@ class _ConfigScreenState extends State<ConfigScreen> {
                 validator: (value) => validateMtu(value ?? ''),
               ),
               const SizedBox(height: 8),
+              if (widget.testConnection != null) ...[
+                OutlinedButton.icon(
+                  key: const Key('config-test-connection'),
+                  onPressed: _testing || _saving ? null : _testConnection,
+                  icon: const Icon(Icons.network_check),
+                  label: Text(
+                    _testing
+                        ? 'Testing Wi-Fi connection…'
+                        : 'Test Wi-Fi connection',
+                  ),
+                ),
+                const Text(
+                  'Tests the WireGuard handshake only. No SIM or mobile data required. Does not save changes.',
+                ),
+                if (_testResult != null) Text(_testResult!),
+              ],
             ],
           ),
         ),

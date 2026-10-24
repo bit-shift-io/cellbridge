@@ -59,7 +59,9 @@ class BridgeService : Service() {
                     }
                     else -> {
                         if (controller == null) {
-                            val network = AndroidBridgeNetworks(getSystemService(ConnectivityManager::class.java))
+                            val network = AndroidBridgeNetworks(getSystemService(ConnectivityManager::class.java)) {
+                                EgressTestOverride.enabled(dev.cellbridge.cellbridge.BuildConfig.DEBUG, contentResolver)
+                            }
                             controller = BridgeController(network, NativeBridge()) { action -> worker.post(action) }
                         }
                         controller!!.startFromStore(EncryptedConfigStore(applicationContext))

@@ -20,6 +20,26 @@ fn checked(env: &mut JNIEnv, operation: impl FnOnce(&mut JNIEnv) -> Result<(), S
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_cellbridge_NativeBridge_nativeTestConnection(
+    mut env: JNIEnv,
+    _this: JObject,
+    config: JString,
+    fd: jint,
+) {
+    checked(&mut env, |env| {
+        if fd < 0 {
+            return Err("invalid Wi-Fi socket descriptor".into());
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let config: String = env
+            .get_string(&config)
+            .map_err(|_| "cannot read bridge configuration")?
+            .into();
+        crate::native::test_connection_json(&config, owned.into_raw_fd())
+    });
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_cellbridge_NativeBridge_nativeStart(
     mut env: JNIEnv,
     _this: JObject,

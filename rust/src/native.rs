@@ -84,3 +84,19 @@ pub fn snapshot_json() -> String {
     })
     .to_string()
 }
+
+/// Owns the Wi-Fi fd immediately, even for malformed configuration or timeout.
+#[cfg(unix)]
+pub fn test_connection_json(json: &str, fd: i32) -> Result<(), String> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if fd < 0 {
+        return Err("invalid Wi-Fi socket descriptor".into());
+    }
+    let socket = std::net::UdpSocket::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let config = serde_json::from_str(json).map_err(|_| "Invalid bridge configuration")?;
+    runtime()?.block_on(crate::connection_test::handshake(
+        config,
+        socket,
+        std::time::Duration::from_secs(15),
+    ))
+}

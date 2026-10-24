@@ -6,7 +6,10 @@ import android.net.NetworkCapabilities
 import java.net.HttpURLConnection
 import java.net.URL
 
-class AndroidBridgeNetworks(private val cm: ConnectivityManager) : BridgeNetworks {
+class AndroidBridgeNetworks(
+    private val cm: ConnectivityManager,
+    private val testOverrideEnabled: () -> Boolean = { false },
+) : BridgeNetworks {
     private val binder = NetworkBinder(cm)
     override fun start(changed: () -> Unit) {
         binder.events = object : NetworkEvents {
@@ -16,12 +19,16 @@ class AndroidBridgeNetworks(private val cm: ConnectivityManager) : BridgeNetwork
         binder.start()
     }
     override fun current(): NetworkSelection? {
-        val cellular = binder.cellularNetwork() ?: return null
         val wifi = binder.wifiNetwork() ?: return null
+        val cellular = binder.cellularNetwork()
+            ?: return if (testOverrideEnabled()) NetworkSelection(wifi, wifi, testOverride = true) else null
         return NetworkSelection(cellular, wifi)
     }
     override fun bindCellular(network: Network): Boolean {
         val caps = cm.getNetworkCapabilities(network) ?: return false
+        if (testOverrideEnabled() && network == binder.wifiNetwork() &&
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return true
         if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
             !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) || caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return false
         return binder.bindProcess(network) && cm.boundNetworkForProcess == network

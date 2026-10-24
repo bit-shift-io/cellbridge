@@ -5,7 +5,7 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 
-data class NetworkSelection(val cellular: Network, val wifi: Network)
+data class NetworkSelection(val cellular: Network, val wifi: Network, val testOverride: Boolean = false)
 
 interface BridgeNetworks {
     fun start(changed: () -> Unit)
@@ -32,6 +32,10 @@ class BridgeController(
 
     fun start(config: Map<String, Any?>): Unit = synchronized(ownershipLock) {
         if (requested) return
+        if (connectionTestRunning) {
+            reportStartupFailure("Connection test in progress; try connecting again when it finishes")
+            return
+        }
         owner?.stop()
         owner = this
         requested = true
@@ -84,7 +88,8 @@ class BridgeController(
             selected = next
             running = true
             error = null
-            event("Cellular binding verified: ${next.cellular}; Wi-Fi socket bound: ${next.wifi}")
+            if (next.testOverride) event("TEST MODE: Wi-Fi egress, cellular NOT verified; Wi-Fi socket bound: ${next.wifi}")
+            else event("Cellular binding verified: ${next.cellular}; Wi-Fi socket bound: ${next.wifi}")
         } catch (failure: Exception) {
             networks.unbind()
             val known = setOf("Invalid phone private key", "Invalid peer public key", "Invalid preshared key",
@@ -117,6 +122,7 @@ class BridgeController(
 
     fun cellularControl(): String {
         val current = selected ?: throw IllegalStateException("No verified cellular binding")
+        check(!current.testOverride) { "No verified cellular binding" }
         return networks.cellularControl(current.cellular)
     }
 
@@ -126,8 +132,9 @@ class BridgeController(
             .put("error", error ?: JSONObject.NULL)
             .put("txBytes", "0").put("rxBytes", "0").put("activeFlows", "0")
         result.put("binding", JSONObject()
-            .put("cellularBindVerified", running)
-            .put("cellularNetwork", selected?.cellular?.toString() ?: JSONObject.NULL)
+            .put("cellularBindVerified", running && selected?.testOverride != true)
+            .put("egressTestOverride", running && selected?.testOverride == true)
+            .put("cellularNetwork", selected?.takeUnless { it.testOverride }?.cellular?.toString() ?: JSONObject.NULL)
             .put("wifiNetwork", selected?.wifi?.toString() ?: JSONObject.NULL))
         val diagnostics = result.optJSONArray("diagnostics") ?: JSONArray()
         for (event in events) diagnostics.put(event)
@@ -149,5 +156,15 @@ class BridgeController(
         // to a Service object. Retire the old owner before a replacement binds.
         private val ownershipLock = Any()
         private var owner: BridgeController? = null
+        private var connectionTestRunning = false
+
+        fun tryBeginConnectionTest(): Boolean = synchronized(ownershipLock) {
+            if (owner?.requested == true || connectionTestRunning) false
+            else { connectionTestRunning = true; true }
+        }
+
+        fun endConnectionTest(): Unit = synchronized(ownershipLock) {
+            connectionTestRunning = false
+        }
     }
 }

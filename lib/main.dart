@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import 'src/bridge.dart' as bridge;
 import 'src/config_screen.dart';
@@ -132,6 +133,18 @@ class _CellBridgeAppState extends State<CellBridgeApp> {
         builder: (_) => ConfigScreen(
           store: store,
           initialConfig: _config,
+          testConnection: defaultTargetPlatform == TargetPlatform.android
+              ? (config) =>
+                    const MethodChannel('dev.cellbridge/bridge')
+                        .invokeMethod<void>('testConnection', {
+                          'privateKey': config.privateKey,
+                          'address': config.address,
+                          'peerPublicKey': config.peerPublicKey,
+                          'endpoint': config.endpoint,
+                          'mtu': config.mtu,
+                          'presharedKey': config.presharedKey,
+                        })
+              : null,
           bridgeRunning: () =>
               bridge.bridgeApi.status().state != bridge.BridgeState.idle,
           onSaved: (config) {

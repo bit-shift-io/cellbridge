@@ -136,6 +136,34 @@ If there is no handshake, check:
 - A read-only packet capture on Ethernet, if needed, can establish whether phone
   datagrams reach Fedora before investigating tunnel keys.
 
+### SIM-free Wi-Fi connection test (debug and release)
+
+With the paired peer running, open **Configuration**, fill in the keys and
+numeric LAN endpoint, and tap **Test Wi-Fi connection** below MTU. Disconnect
+the forwarding service first. The test uses the current form without saving it.
+
+This runs an isolated Rust WireGuard handshake through a Wi-Fi-bound socket.
+It requires no SIM/mobile data, creates no forwarding gateway or internet egress
+sockets, and does not bind the app process to a different network. It closes its
+socket after authenticated success or a 15-second timeout. Results are cleared
+if the form changes. Bridge startup and connection tests are mutually exclusive.
+
+Success establishes Wi-Fi reachability and matching WireGuard keys; cellular
+egress remains a separate test. Actual Pixel 5a results are recorded in
+[phone handshake results](2026-10-24-phone-handshake-results.md).
+
+For development only, debug APKs also support an adb forwarding override:
+
+```sh
+adb shell settings put global cellbridge_egress_test 1
+# Press Connect; without cellular, the tunnel may start over Wi-Fi.
+adb shell settings delete global cellbridge_egress_test
+```
+
+Release builds ignore this setting. Debug diagnostics label the override as
+`egressTestOverride:true` and keep `cellularBindVerified:false`. This override
+does not verify cellular egress; prefer the one-shot button for SIM-free checks.
+
 ## 5. Run checks through the tunnel
 
 Enter these commands in the running test-peer terminal, **one at a time**:
@@ -233,6 +261,8 @@ Verified on Fedora during implementation:
   in the packaged library.
 - Flutter unit/widget tests and static analysis pass.
 
-Not yet verified on the physical phone: Wi-Fi/cellular concurrency, USB tether
-upstream selection, headless native startup, screen-off behavior, boot recovery
-and concurrent LAN access. Record those results separately when executed.
+Physical Pixel 5a verification now establishes Wi-Fi WireGuard handshake with
+the Fedora peer, the release SIM-free test button's success/timeout paths, and
+release rejection of the debug forwarding override. See the dated results above.
+Wi-Fi/cellular concurrency, USB tether upstream selection, headless boot startup,
+screen-off forwarding, boot recovery and concurrent LAN access remain pending.

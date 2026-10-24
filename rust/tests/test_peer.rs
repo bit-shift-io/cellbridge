@@ -12,6 +12,55 @@ use tokio::{
 static BRIDGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
+async fn android_style_dual_stack_socket_accepts_ipv4_peer_replies() {
+    use std::os::fd::IntoRawFd;
+    let _serial = BRIDGE_LOCK.lock().await;
+    let phone = generate_keypair();
+    let router = generate_keypair();
+    let peer = TestPeer::bind(PeerConfig {
+        private_key: router.private_key,
+        peer_public_key: phone.public_key,
+        listen: "127.0.0.1:0".parse().unwrap(),
+        mtu: 1420,
+    })
+    .await
+    .unwrap()
+    .with_timeout(Duration::from_secs(2));
+    let endpoint = peer.local_addr().unwrap();
+    let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None).unwrap();
+    socket.set_only_v6(false).unwrap();
+    socket
+        .bind(&"[::]:0".parse::<std::net::SocketAddr>().unwrap().into())
+        .unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    let (results, mut result_rx) = mpsc::channel(1);
+    let task = tokio::spawn(peer.run(rx, results));
+    cellbridge::start_bridge(
+        BridgeConfig {
+            private_key: phone.private_key,
+            peer_public_key: router.public_key,
+            address: "10.10.10.2/24".into(),
+            endpoint: endpoint.to_string(),
+            mtu: 1420,
+            preshared_key: None,
+        },
+        Some(socket.into_raw_fd()),
+    )
+    .await
+    .unwrap();
+    tx.send(Scenario::Handshake).await.unwrap();
+    let result = result_rx.recv().await.unwrap();
+    cellbridge::stop_bridge().await.unwrap();
+    drop(tx);
+    task.await.unwrap();
+    assert!(
+        result.passed,
+        "dual-stack fd handshake failed: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
 async fn persistent_peer_reauthenticates_after_bridge_changes_source_port() {
     use std::os::fd::IntoRawFd;
     let _serial = BRIDGE_LOCK.lock().await;

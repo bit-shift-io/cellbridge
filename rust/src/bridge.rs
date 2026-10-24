@@ -387,7 +387,12 @@ impl BridgeLoop {
             tokio::select! {
                 _ = &mut stop => break,
                 received = self.tunnel_socket.recv_from(&mut datagram) => {
-                    if let Ok((n, from)) = received && from == self.endpoint {
+                    // Android DatagramSocket is dual-stack: IPv4 replies arrive
+                    // as ::ffff:a.b.c.d. Compare canonical addresses while still
+                    // enforcing the configured peer's IP and port.
+                    if let Ok((n, from)) = received
+                        && from.ip().to_canonical() == self.endpoint.ip().to_canonical()
+                        && from.port() == self.endpoint.port() {
                         // A decrypt error means "wait for the re-handshake"; it
                         // is never a reason to tear the link down.
                         if let Ok(output) = self.tunnel.handle_udp(&datagram[..n]) {

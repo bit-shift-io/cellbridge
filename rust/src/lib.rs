@@ -29,3 +29,4 @@ use flutter_rust_bridge::frb;
 fn init() {
     flutter_rust_bridge::setup_default_user_utils();
 }
+pub mod connection_test;

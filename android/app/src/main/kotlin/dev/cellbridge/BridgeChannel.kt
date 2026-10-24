@@ -15,6 +15,29 @@ const val BRIDGE_CHANNEL = "dev.cellbridge/bridge"
 class BridgeChannel(private val activity: Activity) : MethodChannel.MethodCallHandler {
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
+            "testConnection" -> {
+                val config = try { org.json.JSONObject(call.arguments as Map<*, *>).toString() }
+                    catch (_: Exception) { result.error("connection_test", "Invalid configuration", null); return }
+                if (!BridgeController.tryBeginConnectionTest()) {
+                    result.error("connection_test", "Disconnect the bridge before testing", null); return
+                }
+                val context = activity.applicationContext
+                val main = Handler(Looper.getMainLooper())
+                Thread({
+                    try {
+                        val native = NativeBridge() // Load before transferring a descriptor.
+                        val cm = context.getSystemService(android.net.ConnectivityManager::class.java)
+                        val binder = NetworkBinder(cm)
+                        val wifi = binder.wifiNetwork() ?: throw IllegalStateException("No Wi-Fi network available")
+                        native.testConnection(config, binder.bindWifiSocket(wifi))
+                        main.post { result.success(null) }
+                    } catch (_: LinkageError) {
+                        main.post { result.error("connection_test", "Native connection test unavailable", null) }
+                    } catch (_: Exception) {
+                        main.post { result.error("connection_test", "No authenticated response. Check Wi-Fi, endpoint and paired keys.", null) }
+                    } finally { BridgeController.endConnectionTest() }
+                }, "CellBridge-connection-test").start()
+            }
             "snapshot" -> result.success(BridgeService.lastSnapshot)
             "batterySettings" -> {
                 activity.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
@@ -37,4 +60,5 @@ class BridgeChannel(private val activity: Activity) : MethodChannel.MethodCallHa
             else -> result.notImplemented()
         }
     }
+
 }

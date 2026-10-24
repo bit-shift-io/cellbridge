@@ -9,9 +9,11 @@ app. The router routes the LAN's internet traffic into a **WireGuard** pipe to t
 the phone re-originates it on its cellular radio.
 
 > **Status:** Rust bridge, Android native service, UI and pre-router test tools
-> implemented; physical-device and router-cutover verification pending.
-> See [`docs/superpowers/specs/2026-10-20-cellbridge-design.md`](docs/superpowers/specs/2026-10-20-cellbridge-design.md)
-> and [`docs/superpowers/plans/2026-10-20-cellbridge.md`](docs/superpowers/plans/2026-10-20-cellbridge.md).
+> implemented. Phone-side cellular forwarding is verified on a Pixel 8 with 5G;
+> Flint 3 router-cutover verification is pending.
+> See [`docs/superpowers/specs/2026-10-20-cellbridge-design.md`](docs/superpowers/specs/2026-10-20-cellbridge-design.md),
+> [`docs/superpowers/plans/2026-10-20-cellbridge.md`](docs/superpowers/plans/2026-10-20-cellbridge.md)
+> and [the Pixel 8 5G results](docs/testing/2026-10-24-pixel8-5g-tunnel-results.md).
 
 ## How it works
 
@@ -68,6 +70,26 @@ bridge independently of Flutter; the UI displays its state and diagnostics.
 
 See [the pre-router verification runbook](docs/testing/pre-router-verification.md)
 for builds, key exchange, USB-tether preparation and staged device checks.
+
+### Start a Linux WireGuard test peer
+
+From the project directory:
+
+```sh
+./linux-wg-peer.sh --peer 'PHONE_PUBLIC_KEY'
+```
+
+Use the phone's **Phone public key** from Configuration. The script builds the
+peer, creates/reuses an owner-only Linux key, saves the phone public key, and
+prints the settings for the app. It chooses the default route's IPv4 source
+address; on multi-interface machines, select the shared LAN explicitly with
+`--listen 192.168.1.126:51820`.
+
+On later runs, just use `./linux-wg-peer.sh`. Keys live under
+`${XDG_STATE_HOME:-$HOME/.local/state}/cellbridge/`, outside the repository.
+Keep the terminal open and tap **Test Wi-Fi connection** at the bottom of the
+phone's Configuration screen. No SIM, internet, sudo, or kernel WireGuard setup
+is needed. Ctrl-C or `quit` stops the peer. Run `./linux-wg-peer.sh --help` for options.
 
 ## Hardware
 

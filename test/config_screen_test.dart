@@ -4,6 +4,7 @@
 // MethodChannel or the real application-support directory.
 
 import 'dart:convert';
+import 'dart:async';
 
 import 'package:cellbridge/src/bridge.dart';
 import 'package:cellbridge/src/config_screen.dart';
@@ -83,6 +84,7 @@ Future<void> _pumpScreen(
   bool running = false,
   ValueChanged<BridgeConfig>? onSaved,
   KeyApi? keyApi,
+  Future<void> Function(BridgeConfig)? testConnection,
 }) async {
   await tester.pumpWidget(
     MaterialApp(
@@ -92,6 +94,7 @@ Future<void> _pumpScreen(
         bridgeRunning: () => running,
         onSaved: onSaved,
         keyApi: keyApi,
+        testConnection: testConnection,
       ),
     ),
   );
@@ -115,6 +118,86 @@ Future<void> _save(WidgetTester tester) async {
 }
 
 void main() {
+  testWidgets('editing during a connection test discards its stale success', (
+    tester,
+  ) async {
+    final pending = Completer<void>();
+    await _pumpScreen(
+      tester,
+      store: _storeOn(_MemoryBackend()),
+      initialConfig: _config,
+      testConnection: (_) => pending.future,
+    );
+    await tester.ensureVisible(find.byKey(const Key('config-test-connection')));
+    await tester.tap(find.byKey(const Key('config-test-connection')));
+    await tester.pump();
+    await tester.enterText(
+      find.byKey(const Key('config-endpoint')),
+      '192.168.1.99:51820',
+    );
+    pending.complete();
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Authenticated WireGuard handshake succeeded over Wi-Fi.'),
+      findsNothing,
+    );
+  });
+  testWidgets(
+    'connection test uses form values without saving and shows authenticated result',
+    (tester) async {
+      final backend = _MemoryBackend();
+      BridgeConfig? tested;
+      await _pumpScreen(
+        tester,
+        store: _storeOn(backend),
+        initialConfig: _config,
+        testConnection: (config) async {
+          tested = config;
+        },
+      );
+      await tester.enterText(
+        find.byKey(const Key('config-endpoint')),
+        '192.168.1.126:51820',
+      );
+      await tester.ensureVisible(
+        find.byKey(const Key('config-test-connection')),
+      );
+      await tester.tap(find.byKey(const Key('config-test-connection')));
+      await tester.pumpAndSettle();
+      expect(tested?.endpoint, '192.168.1.126:51820');
+      expect(backend.record, isNull);
+      expect(
+        find.text('Authenticated WireGuard handshake succeeded over Wi-Fi.'),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets(
+    'connection test failure is visible without exposing exception details',
+    (tester) async {
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        initialConfig: _config,
+        testConnection: (_) async {
+          throw StateError('secret key contents');
+        },
+      );
+      await tester.ensureVisible(
+        find.byKey(const Key('config-test-connection')),
+      );
+      await tester.tap(find.byKey(const Key('config-test-connection')));
+      await tester.pumpAndSettle();
+      expect(
+        find.text(
+          'Wi-Fi connection test failed. Check Wi-Fi, endpoint and paired keys.',
+        ),
+        findsOneWidget,
+      );
+      expect(_messagesContaining('secret key contents'), findsNothing);
+    },
+  );
   group('SettingsStore', () {
     test('round-trips a config including the preshared key', () async {
       final backend = _MemoryBackend();

@@ -49,6 +49,36 @@ import org.robolectric.shadows.ShadowNetworkInfo
 @Config(sdk = [35])
 class NetworkBinderTest {
 
+    @Test fun debug_override_allows_wifi_only_without_process_binding_and_recovers_when_disabled() {
+        shadowOf(cm).removeNetwork(cellular)
+        var enabled = true
+        val networks = AndroidBridgeNetworks(cm) { enabled }
+        val selection = networks.current()!!
+        assertTrue(selection.testOverride)
+        assertSame(wifi, selection.wifi)
+        assertTrue(networks.bindCellular(selection.cellular))
+        assertNull(cm.boundNetworkForProcess)
+        enabled = false
+        assertNull(networks.current())
+        assertFalse(networks.bindCellular(wifi))
+    }
+
+    @Test fun debug_override_never_replaces_available_cellular() {
+        val networks = AndroidBridgeNetworks(cm) { true }
+        val selection = networks.current()!!
+        assertFalse(selection.testOverride)
+        assertSame(cellular, selection.cellular)
+    }
+
+    @Test fun release_ignores_adb_setting_even_when_enabled() {
+        val resolver = RuntimeEnvironment.getApplication().contentResolver
+        android.provider.Settings.Global.putInt(resolver, "cellbridge_egress_test", 1)
+        assertFalse(EgressTestOverride.enabled(false, resolver))
+        assertTrue(EgressTestOverride.enabled(true, resolver))
+        android.provider.Settings.Global.putInt(resolver, "cellbridge_egress_test", 0)
+        assertFalse(EgressTestOverride.enabled(true, resolver))
+    }
+
     private lateinit var cm: ConnectivityManager
     private lateinit var wifi: Network
     private lateinit var cellular: Network

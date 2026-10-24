@@ -12,6 +12,14 @@ class NativeBridge : BridgeFacade {
     private external fun nativeStart(config: String, fd: Int)
     private external fun nativeStop()
     private external fun nativeSnapshot(): String
+    private external fun nativeTestConnection(config: String, fd: Int)
+    fun testConnection(configJson: String, fd: Int) {
+        try { nativeTestConnection(configJson, fd) }
+        catch (error: UnsatisfiedLinkError) {
+            android.os.ParcelFileDescriptor.adoptFd(fd).close()
+            throw error
+        }
+    }
     override fun start(configJson: String, fd: Int) {
         try { nativeStart(configJson, fd) }
         catch (error: UnsatisfiedLinkError) {
