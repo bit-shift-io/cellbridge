@@ -9,6 +9,7 @@ import 'src/demo_bridge.dart';
 import 'src/settings_store.dart';
 import 'src/android_bridge.dart';
 import 'src/diagnostics_screen.dart';
+import 'src/qr_scan_screen.dart';
 
 /// Runs the dashboard against the simulated backend on desktop:
 ///
@@ -144,6 +145,11 @@ class _CellBridgeAppState extends State<CellBridgeApp> {
                           'mtu': config.mtu,
                           'presharedKey': config.presharedKey,
                         })
+              : null,
+          scanSetupQr: defaultTargetPlatform == TargetPlatform.android
+              ? (context) => Navigator.of(context).push<String>(
+                  MaterialPageRoute(builder: (_) => const QrScanScreen()),
+                )
               : null,
           bridgeRunning: () =>
               bridge.bridgeApi.status().state != bridge.BridgeState.idle,

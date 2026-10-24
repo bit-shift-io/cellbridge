@@ -52,6 +52,11 @@
 # The phone's *private* key must never be passed to this script or stored on
 # the router.  Only the public key is accepted.
 #
+# The script generates (or reuses) the peer's preshared key and prints the
+# phone's settings plus a QR code for the CellBridge app.  It tries to install
+# `qrencode` while the WAN is still up; if that fails, the text settings and
+# the raw payload are printed instead.
+#
 # POSIX sh / BusyBox ash only.  No bashisms.
 #
 # Run as root on the router.  The script is idempotent and may be re-run on a
@@ -73,6 +78,18 @@ msg()  { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+is_wireguard_key() {
+	[ "${#1}" -eq 44 ] || return 1
+	case "$1" in
+	*=) : ;;
+	*) return 1 ;;
+	esac
+	case "${1%?}" in
+	*[!A-Za-z0-9+/]*) return 1 ;;
+	esac
+	return 0
+}
+
 usage() {
 	cat <<'EOF'
 CellBridge router setup (GL.iNet Flint 3 / OpenWrt fw4)
@@ -88,6 +105,11 @@ Options:
   -h, --help               show this help
 
 The phone's private key must never be given to this script.
+
+It prints the phone's WireGuard settings, including the generated or reused
+preshared key, plus a QR code for the CellBridge app.  Setup installs
+`qrencode` while the WAN is up; if that fails, the text settings and the raw
+payload are printed instead.
 EOF
 }
 
@@ -337,7 +359,19 @@ ensure_wireguard() {
 	die "kernel WireGuard support is unavailable and could not be installed; WAN left enabled"
 }
 
+# The QR is a convenience; never abort setup because this package is missing.
+ensure_qrencode() {
+	command -v qrencode >/dev/null 2>&1 && return 0
+	warn "qrencode not found; trying to install it now"
+	opkg update >/dev/null 2>&1 || true
+	opkg install qrencode >/dev/null 2>&1 || true
+	command -v qrencode >/dev/null 2>&1
+}
+
 ensure_wireguard
+if ! ensure_qrencode; then
+	warn "qrencode is unavailable; the phone settings will be printed as text"
+fi
 
 # ---------------------------------------------------------------------------
 # wg0 interface and the phone peer
@@ -398,6 +432,23 @@ configure_network() {
 	# Reconcile to exactly one peer: the phone.  Deleting and re-adding is
 	# deliberate -- it removes duplicates and stale options from earlier or
 	# hand-edited configs.  The handshake re-establishes within seconds.
+	# Read the old preshared key first: a re-run must not rotate it, or an
+	# already-configured phone would stop handshaking.
+	had_peer=0
+	uci -q get 'network.@wireguard_wg0[0]' >/dev/null 2>&1 && had_peer=1
+	peer_psk=$(uci -q get 'network.@wireguard_wg0[0].preshared_key')
+	if is_wireguard_key "$peer_psk"; then
+		msg "Reusing the existing peer preshared key"
+	else
+		peer_psk=$(wg genpsk) || die "wg genpsk failed"
+		is_wireguard_key "$peer_psk" ||
+			die "generated preshared key has an unexpected shape"
+		msg "Generated a new peer preshared key"
+		if [ "$had_peer" = 1 ]; then
+			warn "the existing peer had no usable preshared key; update any previously configured phone with the new PresharedKey or re-scan the QR"
+		fi
+	fi
+
 	while uci -q delete "network.@wireguard_wg0[0]" >/dev/null 2>&1; do
 		:
 	done
@@ -407,6 +458,11 @@ configure_network() {
 
 	uci set "network.$peer.public_key=$PHONE_PUB" ||
 		die "uci: cannot set the peer public key"
+	# Feed the key to uci over stdin so it does not appear in a helper
+	# process's argument list.
+	uci -q batch <<EOF || die "uci: cannot set the preshared key"
+set network.$peer.preshared_key='$peer_psk'
+EOF
 	# 0.0.0.0/0 is both the default route and the inbound source filter.
 	uci set "network.$peer.allowed_ips=0.0.0.0/0" ||
 		die "uci: cannot set allowed_ips"
@@ -620,10 +676,34 @@ msg ""
 msg "Phone WireGuard settings:"
 msg "  Address    = $PHONE_ADDR"
 msg "  PublicKey  = ${router_pub:-<router public key>}"
+msg "  PresharedKey = $peer_psk"
 msg "  Endpoint   = $lan_ip:$WG_PORT"
 msg "  MTU        = $WG_MTU"
 msg "  AllowedIPs = 0.0.0.0/0"
 msg ""
+
+if [ -z "$router_pub" ]; then
+	warn "cannot render the phone QR: the router public key is unavailable"
+else
+	qr_payload=$(printf 'CELLBRIDGE1:{"address":"%s","peerPublicKey":"%s","presharedKey":"%s","endpoint":"%s:%s","mtu":%s,"phonePublicKey":"%s"}' \
+		"$PHONE_ADDR" "$router_pub" "$peer_psk" "$lan_ip" "$WG_PORT" "$WG_MTU" "$PHONE_PUB")
+
+	msg "Scan this QR code in the CellBridge app:"
+	qr_art=
+	if command -v qrencode >/dev/null 2>&1; then
+		qr_art=$(printf '%s' "$qr_payload" | qrencode -t ANSIUTF8 -m 2 2>/dev/null) || qr_art=
+		if [ -z "$qr_art" ]; then
+			qr_art=$(printf '%s' "$qr_payload" | qrencode -t UTF8 -m 2 2>/dev/null) || qr_art=
+		fi
+	fi
+	if [ -n "$qr_art" ]; then
+		msg "$qr_art"
+	else
+		warn "could not render a QR code; use the text settings above"
+		msg "CellBridge setup payload:"
+		msg "$qr_payload"
+	fi
+fi
 
 if [ "$KEEP_WAN" = 1 ]; then
 	msg "WAN state: --keep-wan (this run did not change it)"

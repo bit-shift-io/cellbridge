@@ -24,6 +24,17 @@ const _rfcPublicKey = 'hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=';
 const _privateKey = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
 const _peerPublicKey = 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=';
 const _presharedKey = 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=';
+const _phonePublicKey = 'DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=';
+
+String _qrPayload({
+  String address = '10.10.10.2/24',
+  String peerPublicKey = _peerPublicKey,
+  String presharedKey = _presharedKey,
+  String endpoint = '192.168.8.1:51820',
+  int mtu = 1420,
+  String? phonePublicKey = _phonePublicKey,
+}) =>
+    'CELLBRIDGE1:${jsonEncode({'address': address, 'peerPublicKey': peerPublicKey, 'presharedKey': presharedKey, 'endpoint': endpoint, 'mtu': mtu, 'phonePublicKey': ?phonePublicKey})}';
 
 const _config = BridgeConfig(
   privateKey: _privateKey,
@@ -85,6 +96,7 @@ Future<void> _pumpScreen(
   ValueChanged<BridgeConfig>? onSaved,
   KeyApi? keyApi,
   Future<void> Function(BridgeConfig)? testConnection,
+  Future<String?> Function(BuildContext)? scanSetupQr,
 }) async {
   await tester.pumpWidget(
     MaterialApp(
@@ -95,6 +107,7 @@ Future<void> _pumpScreen(
         onSaved: onSaved,
         keyApi: keyApi,
         testConnection: testConnection,
+        scanSetupQr: scanSetupQr,
       ),
     ),
   );
@@ -535,6 +548,221 @@ void main() {
         _rfcPublicKey,
       );
       expect(find.text('Phone public key copied.'), findsOneWidget);
+    });
+
+    testWidgets('scan fills router settings and keeps the private key', (
+      tester,
+    ) async {
+      final backend = _MemoryBackend();
+      await _pumpScreen(
+        tester,
+        store: _storeOn(backend),
+        initialConfig: _config,
+        keyApi: _FakeKeyApi(derivations: {_privateKey: _phonePublicKey}),
+        scanSetupQr: (_) async => _qrPayload(),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('config-scan-qr')));
+      await tester.pumpAndSettle();
+
+      expect(_field(tester, 'config-private-key'), _privateKey);
+      expect(_field(tester, 'config-address'), '10.10.10.2/24');
+      expect(_field(tester, 'config-peer-public-key'), _peerPublicKey);
+      expect(_field(tester, 'config-preshared-key'), _presharedKey);
+      expect(_field(tester, 'config-endpoint'), '192.168.8.1:51820');
+      expect(_field(tester, 'config-mtu'), '1420');
+      expect(backend.record, isNull);
+      expect(
+        find.text('Router settings loaded. Review, then Save.'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a scanned config saves with the original private key', (
+      tester,
+    ) async {
+      final backend = _MemoryBackend();
+      final store = _storeOn(backend);
+      await _pumpScreen(
+        tester,
+        store: store,
+        initialConfig: _config,
+        keyApi: _FakeKeyApi(derivations: {_privateKey: _phonePublicKey}),
+        scanSetupQr: (_) async => _qrPayload(),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('config-scan-qr')));
+      await tester.pumpAndSettle();
+      await _save(tester);
+
+      expect(await store.load(), isNotNull);
+      expect(backend.record!['privateKey'], _privateKey);
+      expect(backend.record!['address'], '10.10.10.2/24');
+      expect(backend.record!['peerPublicKey'], _peerPublicKey);
+      expect(backend.record!['presharedKey'], _presharedKey);
+      expect(backend.record!['endpoint'], '192.168.8.1:51820');
+      expect(backend.record!['mtu'], 1420);
+    });
+
+    testWidgets('scan clears a stale connection-test result', (tester) async {
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        initialConfig: _config,
+        keyApi: _FakeKeyApi(derivations: {_privateKey: _phonePublicKey}),
+        testConnection: (_) async {},
+        scanSetupQr: (_) async => _qrPayload(),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.ensureVisible(
+        find.byKey(const Key('config-test-connection')),
+      );
+      await tester.tap(find.byKey(const Key('config-test-connection')));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Authenticated WireGuard handshake succeeded over Wi-Fi.'),
+        findsOneWidget,
+      );
+
+      await tester.ensureVisible(find.byKey(const Key('config-scan-qr')));
+      await tester.tap(find.byKey(const Key('config-scan-qr')));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Authenticated WireGuard handshake succeeded over Wi-Fi.'),
+        findsNothing,
+      );
+    });
+
+    testWidgets('an invalid QR leaves the form alone and shows no payload', (
+      tester,
+    ) async {
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        initialConfig: _config,
+        keyApi: _FakeKeyApi(derivations: {_privateKey: _phonePublicKey}),
+        scanSetupQr: (_) async => 'CELLBRIDGE1:{"address":"SECRET_MARKER"}',
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('config-scan-qr')));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('That QR code is not a CellBridge setup code.'),
+        findsOneWidget,
+      );
+      expect(_field(tester, 'config-address'), _config.address);
+      expect(_field(tester, 'config-endpoint'), _config.endpoint);
+      expect(_messagesContaining('SECRET_MARKER'), findsNothing);
+    });
+
+    testWidgets('a different phone key from the QR produces a warning', (
+      tester,
+    ) async {
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        initialConfig: _config,
+        keyApi: _FakeKeyApi(derivations: {_privateKey: _phonePublicKey}),
+        scanSetupQr: (_) async => _qrPayload(phonePublicKey: _peerPublicKey),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('config-scan-qr')));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.textContaining('expects a different phone key'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('scan warns when the phone key cannot be derived', (
+      tester,
+    ) async {
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        initialConfig: _config,
+        keyApi: _FakeKeyApi(),
+        scanSetupQr: (_) async => _qrPayload(phonePublicKey: _peerPublicKey),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('config-scan-qr')));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.textContaining('could not verify the phone key'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets(
+      'scan verifies against the current private key, not a stale one',
+      (tester) async {
+        final newPrivateKey = base64Encode(List<int>.filled(32, 5));
+        final newPublicKey = base64Encode(List<int>.filled(32, 6));
+        await _pumpScreen(
+          tester,
+          store: _storeOn(_MemoryBackend()),
+          initialConfig: _config,
+          keyApi: _FakeKeyApi(
+            derivations: {
+              _privateKey: _phonePublicKey,
+              newPrivateKey: newPublicKey,
+            },
+          ),
+          scanSetupQr: (_) async => _qrPayload(phonePublicKey: newPublicKey),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.enterText(
+          find.byKey(const Key('config-private-key')),
+          newPrivateKey,
+        );
+        await tester.tap(find.byKey(const Key('config-scan-qr')));
+        await tester.pumpAndSettle();
+
+        expect(
+          find.text('Router settings loaded. Review, then Save.'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('different phone key'), findsNothing);
+      },
+    );
+
+    testWidgets('scanning with no private key asks for a key pair', (
+      tester,
+    ) async {
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        scanSetupQr: (_) async => _qrPayload(),
+      );
+
+      await tester.tap(find.byKey(const Key('config-scan-qr')));
+      await tester.pumpAndSettle();
+
+      expect(_field(tester, 'config-private-key'), '');
+      expect(
+        find.textContaining('Generate a key pair and re-run router setup'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('no scan button without a scanner callback', (tester) async {
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        initialConfig: _config,
+      );
+
+      expect(find.byKey(const Key('config-scan-qr')), findsNothing);
     });
   });
 }

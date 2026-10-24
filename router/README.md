@@ -128,7 +128,7 @@ on a partially configured router.
 | Area | Change |
 | :--- | :--- |
 | `/etc/config/network` | creates/reconciles `network.wg0`: `proto=wireguard`, `addresses=10.10.10.1/24`, `listen_port=51820`, `mtu=1420`, `nohostroute=1`; generates the router private key if absent |
-| Peer | exactly one `wireguard_wg0` peer: `public_key=<phone>`, `allowed_ips=0.0.0.0/0`, `route_allowed_ips=1` (installs the default route) |
+| Peer | exactly one `wireguard_wg0` peer: `public_key=<phone>`, `preshared_key=<generated once and reused>`, `allowed_ips=0.0.0.0/0`, `route_allowed_ips=1` (installs the default route) |
 | `/etc/config/firewall` | zone `vpn` over `wg0` with `input=ACCEPT`, `output=ACCEPT`, `forward=REJECT`, `masq=1`, `mtu_fix=1`; forwarding `lan -> vpn` |
 | `/etc/config/dhcp` | dnsmasq `noresolv=1` and `server=<--dns>` (default `1.1.1.1`), so DNS goes through the tunnel instead of a dead WAN resolver |
 | WAN | `disabled=1` on the detected WAN interface(s), normally `wan` and `wan6` |
@@ -148,9 +148,25 @@ At the end it prints:
 * the router's `wg0` public key,
 * the endpoint `192.168.8.1:51820` (the detected LAN address),
 * the tunnel addresses (`10.10.10.1/24` and `10.10.10.2/24`),
-* the phone's WireGuard settings to enter in the app.
+* the peer preshared key (generated on the first run and reused on re-runs),
+* the phone's WireGuard settings to enter in the app,
+* a terminal QR code the app can scan to fill those settings.
 
 The phone's private key is never accepted, printed or stored by the script.
+The preshared key is generated on the router and is included in the phone
+settings and the QR, so the app does not need to generate one. Treat
+screenshots of this terminal as sensitive.
+
+Upgrade note: older setup versions created the peer without a preshared key.
+The first run after upgrading generates one and adds it to the peer, so any
+phone configured by the old script must be updated with the new `PresharedKey`
+(scan the new QR or enter it) or its handshake will fail. Later runs reuse the
+same key.
+
+The QR is rendered with `qrencode`, which setup installs automatically while
+the WAN is still up. If the package is unavailable or rendering fails, setup
+prints the text settings plus the raw `CELLBRIDGE1:` payload instead and keeps
+going.
 
 ## Run revert
 
@@ -287,5 +303,10 @@ exact record of the previous state.
   because that is the operator's SSH path.
 * IPv6 is out of scope. `wan6` is disabled, and IPv6-only destinations will
   fail.
-* The script does not configure the phone's app; it prints the values the app
-  needs. The phone must be a Wi-Fi client of this router, not a hotspot.
+* QR output needs `qrencode`. Setup installs it via `opkg` before the WAN is
+  disabled, but if the feed is unreachable the script prints the text settings
+  and raw payload instead. A re-run after the WAN is already disabled cannot
+  install it.
+* The script does not configure the phone's app directly; it prints the values
+  and a QR code that the app scans. The phone must be a Wi-Fi client of this
+  router, not a hotspot.

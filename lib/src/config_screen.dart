@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'bridge.dart';
 import 'keys.dart';
 import 'settings_store.dart';
+import 'setup_qr.dart';
 
 /// A form over [BridgeConfig].
 ///
@@ -22,6 +23,7 @@ class ConfigScreen extends StatefulWidget {
     this.onSaved,
     this.keyApi,
     this.testConnection,
+    this.scanSetupQr,
   });
 
   /// Where a validated configuration is written.
@@ -41,6 +43,11 @@ class ConfigScreen extends StatefulWidget {
   /// a fake so they never need the Rust library.
   final KeyApi? keyApi;
   final Future<void> Function(BridgeConfig)? testConnection;
+
+  /// Opens the QR scanner and returns its decoded text, or null if cancelled.
+  ///
+  /// Non-null only on Android; tests inject a fake.
+  final Future<String?> Function(BuildContext context)? scanSetupQr;
 
   @override
   State<ConfigScreen> createState() => _ConfigScreenState();
@@ -76,6 +83,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
   bool _suppressPrivateKeyListener = false;
 
   bool _saving = false;
+  bool _scanning = false;
   bool _testing = false;
   String? _testResult;
   int _testRevision = 0;
@@ -126,6 +134,64 @@ class _ConfigScreenState extends State<ConfigScreen> {
   }
 
   KeyApi get _keys => widget.keyApi ?? keyApi;
+
+  Future<void> _scanSetupQr() async {
+    if (_saving || _scanning) {
+      return;
+    }
+    setState(() => _scanning = true);
+    try {
+      final raw = await widget.scanSetupQr!(context);
+      if (!mounted || raw == null) {
+        return;
+      }
+      try {
+        final payload = parseSetupQr(raw);
+        _address.text = payload.address;
+        _peerPublicKey.text = payload.peerPublicKey;
+        _presharedKey.text = payload.presharedKey ?? '';
+        _endpoint.text = payload.endpoint;
+        _mtu.text = '${payload.mtu}';
+        _invalidateTestResult();
+
+        final privateKey = _privateKey.text.trim();
+        if (privateKey.isEmpty) {
+          _showMessage(
+            'Router settings loaded. Generate a key pair and re-run router setup with its public key.',
+          );
+        } else if (payload.phonePublicKey == null) {
+          _showMessage('Router settings loaded. Review, then Save.');
+        } else {
+          // Refresh the derived key before comparing: the displayed value may
+          // be stale while a debounce is pending, and a failed derivation must
+          // not look like a match.
+          _deriveDebounce?.cancel();
+          await _derivePublicKey(privateKey);
+          if (!mounted) {
+            return;
+          }
+          final currentPublicKey = _publicKey.text.trim();
+          if (currentPublicKey.isEmpty) {
+            _showMessage(
+              'Router settings loaded, but the app could not verify the phone key. Re-run router setup with the public key for this phone.',
+            );
+          } else if (payload.phonePublicKey != currentPublicKey) {
+            _showMessage(
+              'Router settings loaded, but this router expects a different phone key. Re-run router setup with the public key shown above.',
+            );
+          } else {
+            _showMessage('Router settings loaded. Review, then Save.');
+          }
+        }
+      } on FormatException {
+        _showMessage('That QR code is not a CellBridge setup code.');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _scanning = false);
+      }
+    }
+  }
 
   @override
   void initState() {
@@ -348,6 +414,15 @@ class _ConfigScreenState extends State<ConfigScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              if (widget.scanSetupQr != null) ...[
+                OutlinedButton.icon(
+                  key: const Key('config-scan-qr'),
+                  onPressed: _saving || _scanning ? null : _scanSetupQr,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: Text(_scanning ? 'Opening camera…' : 'Scan router QR'),
+                ),
+                const SizedBox(height: 8),
+              ],
               TextFormField(
                 key: const Key('config-private-key'),
                 controller: _privateKey,
