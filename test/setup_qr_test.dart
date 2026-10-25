@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 const _peerPublicKey = 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=';
 const _presharedKey = 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=';
 const _phonePublicKey = 'DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=';
+const _phonePrivateKey = 'dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=';
 
 Map<String, Object?> _base() => {
   'address': '10.10.10.2/24',
@@ -42,6 +43,34 @@ void main() {
   test('treats an absent phone public key as null', () {
     final without = _base()..remove('phonePublicKey');
     expect(parseSetupQr(_encode(without)).phonePublicKey, isNull);
+  });
+
+  test('parses a generated phone private key and retains legacy payloads', () {
+    final generated = _base()..['phonePrivateKey'] = _phonePrivateKey;
+    expect(parseSetupQr(_encode(generated)).phonePrivateKey, _phonePrivateKey);
+    expect(parseSetupQr(_encode(_base())).phonePrivateKey, isNull);
+  });
+
+  test('rejects a provided invalid phone private key without exposing it', () {
+    for (final value in [null, '', 42, 'SECRET_PRIVATE_KEY']) {
+      final payload = _base()..['phonePrivateKey'] = value;
+      expect(() => parseSetupQr(_encode(payload)), throwsFormatException);
+    }
+    try {
+      parseSetupQr(
+        _encode(_base()..['phonePrivateKey'] = 'SECRET_PRIVATE_KEY'),
+      );
+      fail('expected a FormatException');
+    } on FormatException catch (error) {
+      expect(error.toString(), isNot(contains('SECRET_PRIVATE_KEY')));
+    }
+  });
+
+  test('a phone private key requires its public key for pair verification', () {
+    final payload = _base()
+      ..['phonePrivateKey'] = _phonePrivateKey
+      ..remove('phonePublicKey');
+    expect(() => parseSetupQr(_encode(payload)), throwsFormatException);
   });
 
   test('trims surrounding whitespace', () {

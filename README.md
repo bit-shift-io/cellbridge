@@ -48,6 +48,10 @@ Because the phone originates the connections itself, **no root is required** and
 * `router/` — OpenWrt (Flint 3) setup and revert scripts.
 * `docs/` — the design spec and implementation plan.
 
+For router installation, see [router/README.md](router/README.md). Setup generates
+the phone keys so you can run the script, scan its QR, then save/connect in the
+app. The phone asks Yes/No before replacing a different existing key pair.
+
 ## Run the dashboard on Linux (no phone required)
 
 The dashboard runs against a simulated backend, so UI work needs neither an

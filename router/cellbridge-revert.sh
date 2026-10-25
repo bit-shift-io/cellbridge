@@ -7,6 +7,8 @@
 #   * if no snapshot exists, removes what setup added (wg0, its peer,
 #     the "vpn" zone, the lan->vpn forwarding, the DNS override) and re-enables
 #     the WAN interface(s).
+# Generated phone private keys live only in network peer metadata: exact network
+# restore preserves original keys, and targeted peer removal removes new keys.
 #
 # The snapshot is the *only* exact record of the previous state.  This script
 # therefore keeps it when a restore fails, and only deletes it after a

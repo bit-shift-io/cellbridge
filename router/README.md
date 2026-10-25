@@ -25,8 +25,8 @@ change. This supersedes the original fail-closed/no-backup design.
   Wi-Fi afterwards, keeping mobile data enabled.
 - Keep an SSH session open **over the LAN**, preferably from a wired computer.
   Network/firewall reloads may briefly interrupt traffic.
-- In CellBridge Configuration, copy **Phone public key**. The app generates its
-  private key and shows its public key; the private key stays on the phone.
+- Default setup generates the phone keys and includes them in its QR; no phone
+  public-key copy/paste is required. Install the updated app before scanning it.
 - Record a baseline from a LAN client: `curl -4 https://ifconfig.me`.
 - Substitute your router's LAN address below; do not assume its default address.
 
@@ -44,7 +44,7 @@ The monitor must be beside setup. Setup checks this before making configuration
 changes. Run on the router:
 
 ```sh
-sh /root/cellbridge-setup.sh --phone-public-key 'PHONE_PUBLIC_KEY'
+sh /root/cellbridge-setup.sh
 ```
 
 Setup installs any missing WireGuard support, `curl`, `ca-bundle`, `ip-full` and
@@ -56,7 +56,7 @@ Options:
 
 | Option | Effect |
 |---|---|
-| `--phone-public-key KEY` | Required phone WireGuard public key |
+| `--phone-public-key KEY` | Optional: use an existing phone-managed key instead of generating/importing phone keys |
 | `--dns ADDR` | Repeatable public DNS upstream; default `1.1.1.1` |
 | `--wan-iface NAME` | Extra backup UCI interface for snapshot/recovery bookkeeping |
 | `--keep-wan` | Compatibility option; backups always stay enabled |
@@ -64,14 +64,32 @@ Options:
 
 After setup completes, turn off the old phone hotspot if necessary and join the
 phone to this router's Wi-Fi as a **client**. Scan the terminal QR using
-CellBridge Configuration, save the settings, then connect. No internet is needed
+CellBridge Configuration, save the settings, then connect. If the phone already
+has a different key pair, it asks **Overwrite phone keys? — No / Yes**. No or
+dismissal cancels the whole import without changing any form fields or saved
+settings. Yes fills the new keys and settings; **Save** is still required to
+persist them. An empty phone or the same key pair does not need an overwrite
+prompt. No internet is needed
 to scan/save. The router keeps using backup routing until tunnel internet passes
 two consecutive health rounds.
 
-The QR includes the router public key, generated/reused preshared key, LAN
-endpoint, address and MTU. Treat terminal screenshots as sensitive. If QR rendering
-is unavailable, use the printed settings. Re-running setup retains keys and the
-first backup. Older peers without a preshared key must scan the new settings.
+The QR includes the router public key, generated/reused phone private/public key
+pair, preshared key, LAN endpoint, address and MTU. Treat the QR, terminal
+screenshots and any raw QR payload as private key material. If QR rendering is
+unavailable, the raw payload contains the generated private key for manual entry.
+Re-running setup reuses phone/router keys and the first backup. A corrupt stored
+phone pair stops setup rather than silently rotating it. Older peers without a
+preshared key must scan the new settings.
+
+For the original phone-managed-key flow, generate/copy **Phone public key** in
+the app and run:
+
+```sh
+sh /root/cellbridge-setup.sh --phone-public-key 'PHONE_PUBLIC_KEY'
+```
+
+That mode does not generate/store a phone private key or include one in the QR.
+Existing public-only QR codes remain supported by the app.
 
 ## How failover works
 
@@ -131,6 +149,12 @@ have established that its originals are safely recoverable.
 | DNS | Public resolvers via whichever IPv4 path is selected |
 | kmwan | Keep enabled; failover mode; USB metric 1, WAN metric 2 |
 | Service | Install/enable the CellBridge procd monitor |
+
+In generated-key mode, `network.<phone-peer>.cellbridge_phone_private_key` stores
+the phone private key as metadata ignored by netifd. `/etc/config/network` is
+restricted to root-only access before key material is committed. Its existing
+snapshot covers this option too: revert removes new keys or restores any original
+peer metadata along with the rest of the original network configuration.
 
 Upgrading an older fail-closed setup re-enables only backup interfaces that were
 enabled in the original network snapshot. Originally user-disabled interfaces are

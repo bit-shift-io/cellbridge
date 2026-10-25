@@ -33,10 +33,10 @@
 # the phone.  Narrowing it would silently drop those replies.
 #
 # Usage:
-#   sh cellbridge-setup.sh --phone-public-key '<base64 public key>'
+#   sh cellbridge-setup.sh
 #
 # Options:
-#   --phone-public-key KEY   phone's WireGuard *public* key (required)
+#   --phone-public-key KEY   use a phone-managed key instead of generating one
 #   --dns ADDR               upstream resolver for dnsmasq (repeatable,
 #                            default 1.1.1.1)
 #   --wan-iface NAME         extra backup UCI interface (repeatable);
@@ -44,8 +44,9 @@
 #   --keep-wan               accepted for compatibility; backups now stay on
 #   -h, --help               this text
 #
-# The phone's *private* key must never be passed to this script or stored on
-# the router.  Only the public key is accepted.
+# By default a generated phone key pair is stored as owner-only peer metadata
+# and included in the QR. Re-runs reuse it. --phone-public-key retains the
+# original phone-managed-key flow without importing a phone private key.
 #
 # The script generates (or reuses) the peer's preshared key and prints the
 # phone's settings plus a QR code for the CellBridge app.  It tries to install
@@ -96,16 +97,19 @@ usage() {
 CellBridge router setup (GL.iNet Flint 3 / OpenWrt fw4)
 
 Usage:
-  sh cellbridge-setup.sh --phone-public-key '<base64 public key>' [options]
+  sh cellbridge-setup.sh [options]
 
 Options:
-  --phone-public-key KEY   phone WireGuard public key (required)
+  --phone-public-key KEY   optional phone-managed public key (skip generation)
   --dns ADDR               upstream resolver (repeatable, default 1.1.1.1)
   --wan-iface NAME         extra backup UCI interface (repeatable)
   --keep-wan               compatibility option; backups now always stay on
   -h, --help               show this help
 
-The phone's private key must never be given to this script.
+Default: generate/reuse phone keys and import them by scanning the QR. The app
+asks Yes/No before overwriting different existing phone keys. Save applies them.
+Generated keys are stored in root-only network peer metadata for later re-runs.
+Treat the QR and any printed raw QR payload as private key material.
 
 It prints the phone's WireGuard settings, including the generated or reused
 preshared key, plus a QR code for the CellBridge app.  Setup installs
@@ -122,6 +126,9 @@ EOF
 # ---------------------------------------------------------------------------
 
 PHONE_PUB=${CELLBRIDGE_PHONE_PUBLIC_KEY:-}
+PHONE_PRIV=
+MANUAL_PHONE_KEY=0
+[ -z "$PHONE_PUB" ] || MANUAL_PHONE_KEY=1
 DNS_LIST=
 WAN_OVERRIDES=
 
@@ -130,10 +137,12 @@ while [ $# -gt 0 ]; do
 	--phone-public-key)
 		[ $# -ge 2 ] || die "--phone-public-key needs a value"
 		PHONE_PUB=$2
+		MANUAL_PHONE_KEY=1
 		shift 2
 		;;
 	--phone-public-key=*)
 		PHONE_PUB=${1#*=}
+		MANUAL_PHONE_KEY=1
 		shift
 		;;
 	--dns)
@@ -172,22 +181,9 @@ done
 
 # Strip whitespace the operator may have pasted along with the key.
 PHONE_PUB=$(printf '%s' "$PHONE_PUB" | tr -d '[:space:]')
-[ -n "$PHONE_PUB" ] || {
-	usage >&2
-	die "--phone-public-key is required"
-}
-
-# A WireGuard key is 32 bytes -> 44 base64 characters ending in '='.
-PHONE_PUB_LEN=$(printf '%s' "$PHONE_PUB" | wc -c | tr -d ' ')
-[ "$PHONE_PUB_LEN" = 44 ] ||
-	die "the phone public key must be 44 base64 characters (got $PHONE_PUB_LEN)"
-case "$PHONE_PUB" in
-	*=) : ;;
-	*) die "the phone public key must end with '='" ;;
-esac
-case "$PHONE_PUB" in
-	*[!A-Za-z0-9+/=]*) die "the phone public key contains non-base64 characters" ;;
-esac
+if [ "$MANUAL_PHONE_KEY" = 1 ]; then
+	is_wireguard_key "$PHONE_PUB" || die "the phone public key must be a 44-character base64 WireGuard key"
+fi
 
 for d in $DNS_LIST; do
 	case "$d" in
@@ -491,9 +487,29 @@ ensure_failover_tools() {
 	[ -s /etc/ssl/certs/ca-certificates.crt ] || die "a CA bundle is required for HTTPS health checks"
 }
 
+choose_phone_keys() {
+	[ "$MANUAL_PHONE_KEY" = 0 ] || return 0
+	if PHONE_PRIV=$(uci -q get 'network.@wireguard_wg0[0].cellbridge_phone_private_key'); then
+		is_wireguard_key "$PHONE_PRIV" || die "stored generated phone key is invalid; refusing to rotate it"
+		PHONE_PUB=$(printf '%s\n' "$PHONE_PRIV" | wg pubkey 2>/dev/null) ||
+			die "stored generated phone key is unusable; refusing to rotate it"
+		[ "$PHONE_PUB" = "$(uci -q get 'network.@wireguard_wg0[0].public_key')" ] ||
+			die "stored generated phone keys do not match the configured peer; repair the pair or specify --phone-public-key"
+		msg "Reusing generated phone keys for QR setup"
+	else
+		PHONE_PRIV=$(wg genkey) || die "cannot generate phone keys"
+		is_wireguard_key "$PHONE_PRIV" || die "generated phone key has an unexpected shape"
+		PHONE_PUB=$(printf '%s\n' "$PHONE_PRIV" | wg pubkey 2>/dev/null) ||
+			die "cannot derive the generated phone public key"
+		msg "Generated phone keys for QR setup"
+	fi
+	is_wireguard_key "$PHONE_PUB" || die "generated phone public key has an unexpected shape"
+}
+
 ensure_failover_tools
 # Check on EVERY run, including upgrades with an existing managed worker.
 sh "$MONITOR_SOURCE" check || die "cannot inspect routing or reserved tables/rules contain foreign entries"
+choose_phone_keys
 # Record installation provenance separately from restored original managed files.
 printf '2\n' > "$INSTALL_MARKER.new" && mv "$INSTALL_MARKER.new" "$INSTALL_MARKER" ||
 	die "cannot record installation ownership"
@@ -596,6 +612,13 @@ configure_network() {
 	uci -q batch <<EOF || die "uci: cannot set the preshared key"
 set network.$peer.preshared_key='$peer_psk'
 EOF
+	if [ -n "$PHONE_PRIV" ]; then
+		# CellBridge-only metadata: netifd ignores this option. Keeping it with
+		# the peer makes re-runs reproducible and covers it with network backup.
+		uci -q batch <<EOF || die "uci: cannot retain generated phone keys"
+set network.$peer.cellbridge_phone_private_key='$PHONE_PRIV'
+EOF
+	fi
 	# Keep broad cryptokey routing, but let internet health own the default.
 	uci set "network.$peer.allowed_ips=0.0.0.0/0" ||
 		die "uci: cannot set allowed_ips"
@@ -740,6 +763,8 @@ configure_dns() {
 	uci commit dhcp || die "uci commit dhcp failed"
 }
 
+# Restrict the existing file BEFORE committing any generated private material.
+chmod 600 /etc/config/network || die "cannot protect network key storage"
 ensure_private_key
 configure_network
 configure_backup_priority
@@ -844,6 +869,9 @@ msg "DNS upstream (selected path): $(printf '%s' "$DNS_LIST" | sed 's/^ //')"
 msg "Backup directory:            $STATE_DIR"
 msg ""
 msg "Phone WireGuard settings:"
+if [ -n "$PHONE_PRIV" ]; then
+	msg "  PrivateKey = (included in the QR; retained root-only for re-runs)"
+fi
 msg "  Address    = $PHONE_ADDR"
 msg "  PublicKey  = ${router_pub:-<router public key>}"
 msg "  PresharedKey = $peer_psk"
@@ -851,12 +879,15 @@ msg "  Endpoint   = $lan_ip:$WG_PORT"
 msg "  MTU        = $WG_MTU"
 msg "  AllowedIPs = 0.0.0.0/0"
 msg ""
-
 if [ -z "$router_pub" ]; then
 	warn "cannot render the phone QR: the router public key is unavailable"
 else
-	qr_payload=$(printf 'CELLBRIDGE1:{"address":"%s","peerPublicKey":"%s","presharedKey":"%s","endpoint":"%s:%s","mtu":%s,"phonePublicKey":"%s"}' \
-		"$PHONE_ADDR" "$router_pub" "$peer_psk" "$lan_ip" "$WG_PORT" "$WG_MTU" "$PHONE_PUB")
+	phone_key_json=
+	if [ -n "$PHONE_PRIV" ]; then
+		phone_key_json=$(printf ',"phonePrivateKey":"%s"' "$PHONE_PRIV")
+	fi
+	qr_payload=$(printf 'CELLBRIDGE1:{"address":"%s","peerPublicKey":"%s","presharedKey":"%s","endpoint":"%s:%s","mtu":%s,"phonePublicKey":"%s"%s}' \
+		"$PHONE_ADDR" "$router_pub" "$peer_psk" "$lan_ip" "$WG_PORT" "$WG_MTU" "$PHONE_PUB" "$phone_key_json")
 
 	msg "Scan this QR code in the CellBridge app:"
 	qr_art=

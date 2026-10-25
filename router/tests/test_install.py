@@ -13,9 +13,11 @@ import unittest
 
 ROUTER = Path(__file__).resolve().parents[1]
 KEY = "A" * 43 + "="
+PHONE_PRIVATE = "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo="
+PHONE_PUBLIC = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo="
 
 OPENWRT_COMMAND = r'''#!/usr/bin/env python3
-import json, os, pathlib, re, subprocess, sys
+import base64, hashlib, json, os, pathlib, re, subprocess, sys
 root = pathlib.Path(os.environ["SANDBOX"])
 cmd, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
 with (root / "events").open("a") as out:
@@ -108,17 +110,29 @@ elif cmd == "ip":
         if os.environ.get("ROUTE_CONFLICT") == "1":
             print("default via 192.0.2.1 dev uplink table 51820 proto 4")
 elif cmd == "wg":
-    if args[0] in ("genkey", "genpsk"):
+    if args[0] == "genkey":
+        count_file = root / "genkey-count"
+        count = int(count_file.read_text()) + 1 if count_file.exists() else 1
+        count_file.write_text(str(count))
+        print("dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=" if count == 1 else base64.b64encode(bytes([count]) * 32).decode())
+    elif args[0] == "genpsk":
         print("A" * 43 + "=")
     elif args[0] == "pubkey":
-        sys.stdin.read()
-        print("B" * 43 + "=")
+        private = sys.stdin.read().strip()
+        try:
+            raw = base64.b64decode(private, validate=True)
+            assert len(raw) == 32
+        except Exception:
+            sys.exit(1)
+        print("hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=" if private == "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=" else base64.b64encode(hashlib.sha256(raw).digest()).decode())
     elif args[0] == "show":
         print("B" * 43 + "=")
 elif cmd == "id":
     print("0")
 elif cmd == "qrencode":
-    sys.stdin.read()
+    (root / "qr-payload").write_text(sys.stdin.read())
+    if os.environ.get("FAIL_QR_RENDER") == "1":
+        sys.exit(1)
     print("[QR]")
 elif cmd == "opkg":
     sys.exit(1)  # Tests use existing dependencies; no installation is allowed.
@@ -379,6 +393,88 @@ esac
         self.run_script("cellbridge-revert.sh")
         self.assertFalse((self.root / "service-enabled").exists())
         self.assertTrue((self.root / "service-running").exists())
+
+    def qr_payload(self):
+        return json.loads((self.root / "qr-payload").read_text().removeprefix("CELLBRIDGE1:"))
+
+    def test_default_setup_generates_phone_keys_once_and_revert_removes_them(self):
+        result = self.run_script("cellbridge-setup.sh")
+        payload = self.qr_payload()
+        self.assertEqual(payload["phonePrivateKey"], PHONE_PRIVATE)
+        self.assertEqual(payload["phonePublicKey"], PHONE_PUBLIC)
+        peers = [v for v in self.config("network").values() if v["_type"] == "wireguard_wg0"]
+        self.assertEqual(peers[0]["public_key"], PHONE_PUBLIC)
+        self.assertEqual(peers[0]["cellbridge_phone_private_key"], PHONE_PRIVATE)
+        self.assertNotEqual(self.config("network")["wg0"]["private_key"], PHONE_PRIVATE)
+        self.assertEqual((self.root / "etc/config/network").stat().st_mode & 0o077, 0)
+        self.assertNotIn(PHONE_PRIVATE, result.stdout + result.stderr)
+        self.assertNotIn(PHONE_PRIVATE, (self.root / "events").read_text())
+        self.run_script("cellbridge-setup.sh")
+        self.assertEqual(self.qr_payload(), payload)
+        self.assertEqual((self.root / "genkey-count").read_text(), "2")
+        self.assertEqual((self.root / "etc/cellbridge-backup/network").read_bytes(), self.originals["network"])
+        self.run_script("cellbridge-revert.sh")
+        self.assertEqual((self.root / "etc/config/network").read_bytes(), self.originals["network"])
+
+    def test_explicit_phone_public_key_keeps_phone_managed_key_flow(self):
+        self.setup_router()
+        self.assertNotIn("phonePrivateKey", self.qr_payload())
+        self.assertEqual(self.qr_payload()["phonePublicKey"], KEY)
+        peers = [v for v in self.config("network").values() if v["_type"] == "wireguard_wg0"]
+        self.assertNotIn("cellbridge_phone_private_key", peers[0])
+
+    def test_corrupt_stored_phone_key_aborts_instead_of_rotating_it(self):
+        network = self.config("network")
+        network["phone"] = {"_type": "wireguard_wg0", "public_key": PHONE_PUBLIC,
+                            "cellbridge_phone_private_key": "invalid-secret"}
+        path = self.root / "etc/config/network"
+        path.write_text(json.dumps(network))
+        before = path.read_bytes()
+        result = self.run_script("cellbridge-setup.sh", success=False)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertNotIn("invalid-secret", result.stdout + result.stderr)
+        self.assertFalse((self.root / "genkey-count").exists())
+
+    def test_stored_generated_pair_must_match_and_is_restored_from_backup(self):
+        network = self.config("network")
+        network["phone"] = {"_type": "wireguard_wg0", "public_key": KEY,
+                            "cellbridge_phone_private_key": PHONE_PRIVATE}
+        path = self.root / "etc/config/network"
+        path.write_text(json.dumps(network))
+        before = path.read_bytes()
+        self.run_script("cellbridge-setup.sh", success=False)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_revert_preserves_original_generated_phone_key_metadata(self):
+        network = self.config("network")
+        network["phone"] = {"_type": "wireguard_wg0", "public_key": PHONE_PUBLIC,
+                            "cellbridge_phone_private_key": PHONE_PRIVATE}
+        path = self.root / "etc/config/network"
+        path.write_text(json.dumps(network))
+        original = path.read_bytes()
+        self.run_script("cellbridge-setup.sh")
+        self.assertEqual(self.qr_payload()["phonePrivateKey"], PHONE_PRIVATE)
+        self.run_script("cellbridge-revert.sh")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_switching_generated_keys_to_manual_mode_removes_private_qr_metadata(self):
+        self.run_script("cellbridge-setup.sh")
+        self.setup_router()
+        self.assertNotIn("phonePrivateKey", self.qr_payload())
+        self.assertEqual(self.qr_payload()["phonePublicKey"], KEY)
+        peers = [v for v in self.config("network").values() if v["_type"] == "wireguard_wg0"]
+        self.assertNotIn("cellbridge_phone_private_key", peers[0])
+        self.assertEqual((self.root / "genkey-count").read_text(), "2")
+
+    def test_failed_qr_renderer_prints_matching_raw_payload_without_argv_leaks(self):
+        self.env["FAIL_QR_RENDER"] = "1"
+        result = self.run_script("cellbridge-setup.sh")
+        raw = next(line for line in result.stdout.splitlines() if line.startswith("CELLBRIDGE1:"))
+        payload = json.loads(raw.removeprefix("CELLBRIDGE1:"))
+        self.assertEqual(payload["phonePrivateKey"], PHONE_PRIVATE)
+        self.assertEqual(payload["phonePublicKey"], PHONE_PUBLIC)
+        self.assertNotIn(PHONE_PRIVATE, result.stderr)
+        self.assertNotIn(PHONE_PRIVATE, (self.root / "events").read_text())
 
 
 if __name__ == "__main__":

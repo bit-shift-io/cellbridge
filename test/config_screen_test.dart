@@ -33,8 +33,9 @@ String _qrPayload({
   String endpoint = '192.168.8.1:51820',
   int mtu = 1420,
   String? phonePublicKey = _phonePublicKey,
+  String? phonePrivateKey,
 }) =>
-    'CELLBRIDGE1:${jsonEncode({'address': address, 'peerPublicKey': peerPublicKey, 'presharedKey': presharedKey, 'endpoint': endpoint, 'mtu': mtu, 'phonePublicKey': ?phonePublicKey})}';
+    'CELLBRIDGE1:${jsonEncode({'address': address, 'peerPublicKey': peerPublicKey, 'presharedKey': presharedKey, 'endpoint': endpoint, 'mtu': mtu, 'phonePublicKey': ?phonePublicKey, 'phonePrivateKey': ?phonePrivateKey})}';
 
 const _config = BridgeConfig(
   privateKey: _privateKey,
@@ -63,23 +64,31 @@ SettingsStore _storeOn(_MemoryBackend backend) =>
 
 /// Stand-in for the Rust key functions.
 class _FakeKeyApi implements KeyApi {
-  _FakeKeyApi({this.pair, Map<String, String>? derivations})
-    : derivations = derivations ?? const {};
+  _FakeKeyApi({
+    this.pair,
+    Map<String, String>? derivations,
+    this.onGenerate,
+    this.onDerive,
+  }) : derivations = derivations ?? const {};
 
   final BridgeKeypair? pair;
   final Map<String, String> derivations;
+  final Future<BridgeKeypair> Function()? onGenerate;
+  final Future<String> Function(String)? onDerive;
   int generateCalls = 0;
   final List<String> deriveCalls = [];
 
   @override
   Future<BridgeKeypair> generate() async {
     generateCalls++;
+    if (onGenerate != null) return onGenerate!();
     return pair!;
   }
 
   @override
   Future<String> derive(String privateKey) async {
     deriveCalls.add(privateKey);
+    if (onDerive != null) return onDerive!(privateKey);
     final publicKey = derivations[privateKey];
     if (publicKey == null) {
       throw const FormatException('unrecognised test key');
@@ -127,6 +136,12 @@ Finder _messagesContaining(String text) => find.byWidgetPredicate(
 
 Future<void> _save(WidgetTester tester) async {
   await tester.tap(find.byKey(const Key('config-save')));
+  await tester.pumpAndSettle();
+}
+
+Future<void> _scan(WidgetTester tester) async {
+  await tester.ensureVisible(find.byKey(const Key('config-scan-qr')));
+  await tester.tap(find.byKey(const Key('config-scan-qr')));
   await tester.pumpAndSettle();
 }
 
@@ -550,6 +565,99 @@ void main() {
       expect(find.text('Phone public key copied.'), findsOneWidget);
     });
 
+    testWidgets(
+      'pending generation blocks scanning until its keys are applied',
+      (tester) async {
+        final pending = Completer<BridgeKeypair>();
+        var scanned = false;
+        final backend = _MemoryBackend();
+        await _pumpScreen(
+          tester,
+          store: _storeOn(backend),
+          initialConfig: _config,
+          keyApi: _FakeKeyApi(
+            derivations: {
+              _privateKey: _phonePublicKey,
+              _rfcPrivateKey: _rfcPublicKey,
+            },
+            onGenerate: () => pending.future,
+          ),
+          scanSetupQr: (_) async {
+            scanned = true;
+            return _qrPayload(
+              phonePrivateKey: _rfcPrivateKey,
+              phonePublicKey: _rfcPublicKey,
+            );
+          },
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('config-generate-keypair')));
+        await tester.pump();
+        await _scan(tester);
+        final scannedWhileGenerating = scanned;
+        pending.complete(
+          const BridgeKeypair(
+            privateKey: _presharedKey,
+            publicKey: _peerPublicKey,
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(scannedWhileGenerating, isFalse);
+        expect(find.byType(AlertDialog), findsNothing);
+        expect(_field(tester, 'config-private-key'), _presharedKey);
+        await _scan(tester);
+        await tester.tap(find.text('Yes'));
+        await tester.pumpAndSettle();
+        expect(_field(tester, 'config-private-key'), _rfcPrivateKey);
+        expect(backend.record, isNull);
+      },
+    );
+
+    testWidgets(
+      'pending Save blocks scanning and cannot persist a later QR import',
+      (tester) async {
+        final pending = Completer<String>();
+        var saving = false;
+        var scanned = false;
+        final backend = _MemoryBackend();
+        await _pumpScreen(
+          tester,
+          store: _storeOn(backend),
+          initialConfig: _config,
+          keyApi: _FakeKeyApi(
+            onDerive: (privateKey) async {
+              if (privateKey == _rfcPrivateKey) return _rfcPublicKey;
+              if (saving) return pending.future;
+              return _phonePublicKey;
+            },
+          ),
+          scanSetupQr: (_) async {
+            scanned = true;
+            return _qrPayload(
+              phonePrivateKey: _rfcPrivateKey,
+              phonePublicKey: _rfcPublicKey,
+            );
+          },
+        );
+        await tester.pumpAndSettle();
+        saving = true;
+        await tester.tap(find.byKey(const Key('config-save')));
+        await tester.pump();
+        await _scan(tester);
+        final scannedWhileSaving = scanned;
+        pending.complete(_phonePublicKey);
+        await tester.pumpAndSettle();
+        expect(scannedWhileSaving, isFalse);
+        expect(backend.record!['privateKey'], _privateKey);
+        await _scan(tester);
+        await tester.tap(find.text('Yes'));
+        await tester.pumpAndSettle();
+        expect(_field(tester, 'config-private-key'), _rfcPrivateKey);
+        expect(backend.record!['privateKey'], _privateKey);
+        expect(backend.record!['endpoint'], _config.endpoint);
+      },
+    );
+
     testWidgets('scan fills router settings and keeps the private key', (
       tester,
     ) async {
@@ -578,6 +686,173 @@ void main() {
         findsOneWidget,
       );
     });
+
+    testWidgets(
+      'generated-key QR provisions an empty phone without an overwrite prompt',
+      (tester) async {
+        final backend = _MemoryBackend();
+        await _pumpScreen(
+          tester,
+          store: _storeOn(backend),
+          keyApi: _FakeKeyApi(derivations: {_rfcPrivateKey: _rfcPublicKey}),
+          scanSetupQr: (_) async => _qrPayload(
+            phonePrivateKey: _rfcPrivateKey,
+            phonePublicKey: _rfcPublicKey,
+          ),
+        );
+        await _scan(tester);
+        expect(find.byType(AlertDialog), findsNothing);
+        expect(_field(tester, 'config-private-key'), _rfcPrivateKey);
+        expect(_field(tester, 'config-public-key'), _rfcPublicKey);
+        expect(_field(tester, 'config-endpoint'), '192.168.8.1:51820');
+        expect(backend.record, isNull);
+        expect(_messagesContaining(_rfcPrivateKey), findsNothing);
+        await _save(tester);
+        expect(backend.record!['privateKey'], _rfcPrivateKey);
+      },
+    );
+
+    testWidgets(
+      'Yes overwrites the phone key in the form and persists only on Save',
+      (tester) async {
+        final backend = _MemoryBackend();
+        await _pumpScreen(
+          tester,
+          store: _storeOn(backend),
+          initialConfig: _config,
+          keyApi: _FakeKeyApi(
+            derivations: {
+              _privateKey: _phonePublicKey,
+              _rfcPrivateKey: _rfcPublicKey,
+            },
+          ),
+          scanSetupQr: (_) async => _qrPayload(
+            phonePrivateKey: _rfcPrivateKey,
+            phonePublicKey: _rfcPublicKey,
+          ),
+        );
+        await _scan(tester);
+        expect(find.text('Overwrite phone keys?'), findsOneWidget);
+        expect(_field(tester, 'config-private-key'), _privateKey);
+        expect(_field(tester, 'config-endpoint'), _config.endpoint);
+        expect(_messagesContaining(_rfcPrivateKey), findsNothing);
+        await tester.tap(find.text('Yes'));
+        await tester.pumpAndSettle();
+        expect(_field(tester, 'config-private-key'), _rfcPrivateKey);
+        expect(_field(tester, 'config-public-key'), _rfcPublicKey);
+        expect(_field(tester, 'config-address'), '10.10.10.2/24');
+        expect(backend.record, isNull);
+        await _save(tester);
+        expect(backend.record!['privateKey'], _rfcPrivateKey);
+        expect(backend.record!['endpoint'], '192.168.8.1:51820');
+      },
+    );
+
+    for (final dismiss in [false, true]) {
+      testWidgets(
+        '${dismiss ? 'Dismissing' : 'No on'} overwrite leaves every field and saved settings untouched',
+        (tester) async {
+          final backend = _MemoryBackend();
+          final store = _storeOn(backend);
+          await store.save(_config);
+          await _pumpScreen(
+            tester,
+            store: store,
+            initialConfig: _config,
+            keyApi: _FakeKeyApi(
+              derivations: {
+                _privateKey: _phonePublicKey,
+                _rfcPrivateKey: _rfcPublicKey,
+              },
+            ),
+            scanSetupQr: (_) async => _qrPayload(
+              phonePrivateKey: _rfcPrivateKey,
+              phonePublicKey: _rfcPublicKey,
+            ),
+          );
+          await _scan(tester);
+          expect(find.text('Overwrite phone keys?'), findsOneWidget);
+          if (dismiss) {
+            await tester.tapAt(const Offset(5, 5));
+          } else {
+            await tester.tap(find.text('No'));
+          }
+          await tester.pumpAndSettle();
+          expect(find.byType(AlertDialog), findsNothing);
+          expect(_field(tester, 'config-private-key'), _config.privateKey);
+          expect(_field(tester, 'config-public-key'), _phonePublicKey);
+          expect(_field(tester, 'config-address'), _config.address);
+          expect(
+            _field(tester, 'config-peer-public-key'),
+            _config.peerPublicKey,
+          );
+          expect(_field(tester, 'config-preshared-key'), _config.presharedKey);
+          expect(_field(tester, 'config-endpoint'), _config.endpoint);
+          expect(_field(tester, 'config-mtu'), '${_config.mtu}');
+          expect(await store.load(), _config);
+        },
+      );
+    }
+
+    testWidgets('scanning the same phone key again does not ask to overwrite', (
+      tester,
+    ) async {
+      await _pumpScreen(
+        tester,
+        store: _storeOn(_MemoryBackend()),
+        initialConfig: const BridgeConfig(
+          privateKey: _rfcPrivateKey,
+          address: '10.7.0.2/24',
+          peerPublicKey: _peerPublicKey,
+          endpoint: '203.0.113.1:51820',
+          mtu: 1420,
+        ),
+        keyApi: _FakeKeyApi(derivations: {_rfcPrivateKey: _rfcPublicKey}),
+        scanSetupQr: (_) async => _qrPayload(
+          phonePrivateKey: _rfcPrivateKey,
+          phonePublicKey: _rfcPublicKey,
+        ),
+      );
+      await _scan(tester);
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(_field(tester, 'config-private-key'), _rfcPrivateKey);
+      expect(_field(tester, 'config-endpoint'), '192.168.8.1:51820');
+    });
+
+    for (final derivationFails in [false, true]) {
+      testWidgets(
+        '${derivationFails ? 'Unusable' : 'Mismatched'} scanned phone key is rejected before changing the form',
+        (tester) async {
+          final backend = _MemoryBackend();
+          await _pumpScreen(
+            tester,
+            store: _storeOn(backend),
+            initialConfig: _config,
+            keyApi: _FakeKeyApi(
+              derivations: {
+                _privateKey: _phonePublicKey,
+                if (!derivationFails) _rfcPrivateKey: _rfcPublicKey,
+              },
+            ),
+            scanSetupQr: (_) async => _qrPayload(
+              phonePrivateKey: _rfcPrivateKey,
+              phonePublicKey: _phonePublicKey,
+            ),
+          );
+          await _scan(tester);
+          expect(find.byType(AlertDialog), findsNothing);
+          expect(_field(tester, 'config-private-key'), _privateKey);
+          expect(_field(tester, 'config-endpoint'), _config.endpoint);
+          expect(_field(tester, 'config-address'), _config.address);
+          expect(backend.record, isNull);
+          expect(
+            find.text('That QR code is not a CellBridge setup code.'),
+            findsOneWidget,
+          );
+          expect(_messagesContaining(_rfcPrivateKey), findsNothing);
+        },
+      );
+    }
 
     testWidgets('a scanned config saves with the original private key', (
       tester,

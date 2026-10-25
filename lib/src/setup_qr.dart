@@ -5,7 +5,7 @@ import 'settings_store.dart';
 /// Prefix that identifies a CellBridge setup QR payload.
 const String setupQrPrefix = 'CELLBRIDGE1:';
 
-/// The router-side values imported from a setup QR code.
+/// Router settings and an optional generated phone key imported from a setup QR.
 class SetupQrPayload {
   const SetupQrPayload({
     required this.address,
@@ -14,6 +14,7 @@ class SetupQrPayload {
     required this.mtu,
     this.presharedKey,
     this.phonePublicKey,
+    this.phonePrivateKey,
   });
 
   final String address;
@@ -22,6 +23,7 @@ class SetupQrPayload {
   final String endpoint;
   final int mtu;
   final String? phonePublicKey;
+  final String? phonePrivateKey;
 }
 
 /// Parses the text encoded in a setup QR code.
@@ -73,12 +75,20 @@ SetupQrPayload parseSetupQr(String raw) {
   }
   final presharedKey = optionalString('presharedKey');
   final phonePublicKey = optionalString('phonePublicKey');
+  // If supplied, an empty/null/wrong-type private key is a broken provisioned
+  // payload, not permission to silently keep using an unrelated phone key.
+  final phonePrivateKey = map.containsKey('phonePrivateKey')
+      ? requiredString('phonePrivateKey').trim()
+      : null;
 
   if (validateAddress(address) != null ||
       validatePeerPublicKey(peerPublicKey) != null ||
       validatePresharedKey(presharedKey) != null ||
       validateEndpoint(endpoint) != null ||
       validateMtuNumber(mtuValue) != null ||
+      (phonePrivateKey != null &&
+          (validatePrivateKey(phonePrivateKey) != null ||
+              phonePublicKey == null)) ||
       (phonePublicKey != null &&
           validatePeerPublicKey(phonePublicKey) != null)) {
     _invalid();
@@ -91,6 +101,7 @@ SetupQrPayload parseSetupQr(String raw) {
     endpoint: endpoint,
     mtu: mtuValue,
     phonePublicKey: phonePublicKey,
+    phonePrivateKey: phonePrivateKey,
   );
 }
 

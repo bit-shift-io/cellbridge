@@ -12,18 +12,20 @@ verification and revert procedure. This supersedes the old fail-closed setup.
 
 1. Keep the current hotspot/WAN internet working while setup installs dependencies.
 2. Copy all three scripts from `router/`: setup, revert and failover.
-3. Copy **Phone public key** from CellBridge Configuration; its private key stays
-   on the phone. Keep LAN SSH open and run setup with that public key.
+3. Keep LAN SSH open and run `sh /root/cellbridge-setup.sh`. It generates/reuses
+   both router and phone key pairs; no phone public-key copy/paste is needed.
 4. After setup finishes, switch the phone from hotspot to the router's Wi-Fi
    client connection, leaving mobile data enabled.
-5. Scan the printed setup QR, save and connect in CellBridge. The router keeps
+5. Scan the printed setup QR. If it would replace different existing phone keys,
+   answer **Yes** to overwrite or **No** to cancel the import without changing
+   anything. Save and connect in CellBridge. The router keeps
    backup routing until tunnel internet has passed two consecutive checks.
 
 ## Phone settings
 
 | Setting | Value |
 |---|---|
-| Private key | Generated/kept by the app |
+| Private key | Generated/reused by setup, imported through QR, stored encrypted by the app |
 | Address | `10.10.10.2/24` |
 | Peer public key | Router public key printed by setup |
 | Preshared key | Generated/reused by setup; included in QR |
@@ -36,6 +38,8 @@ Setup snapshots network, firewall, DNS, kmwan and any previous managed monitor
 files/service state under `/etc/cellbridge-backup/`. First backups are retained
 across re-runs. Revert stops/removes new tunnel health routing, restores the
 original configuration and retains backups if restoration fails.
+Generated phone keys are kept in root-only network peer metadata and are covered
+by the network snapshot. Treat the QR and raw payload as private key material.
 
 ```sh
 sh /root/cellbridge-revert.sh

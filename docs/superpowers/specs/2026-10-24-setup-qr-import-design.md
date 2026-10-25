@@ -3,6 +3,13 @@
 Date: 2026-10-24
 Status: awaiting approval
 
+**Update (2026-10-26):** The approved generated-phone-key flow in
+[`../plans/2026-10-26-generated-phone-qr.md`](../plans/2026-10-26-generated-phone-qr.md)
+supersedes this document's phone-private-key exclusion. Default router setup now
+generates/reuses the phone pair and includes it in the QR; the app asks Yes/No
+before replacing different existing keys. Explicit phone-managed keys and these
+older public-only QR payloads remain supported.
+
 ## Intent
 
 After `router/cellbridge-setup.sh` runs, the operator must currently retype the

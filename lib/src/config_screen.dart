@@ -84,6 +84,8 @@ class _ConfigScreenState extends State<ConfigScreen> {
 
   bool _saving = false;
   bool _scanning = false;
+  bool _generating = false;
+  bool get _formBusy => _saving || _scanning || _generating;
   bool _testing = false;
   String? _testResult;
   int _testRevision = 0;
@@ -94,6 +96,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
   }
 
   Future<void> _testConnection() async {
+    if (_formBusy || _testing) return;
     if (widget.bridgeRunning()) {
       _showMessage('Disconnect the bridge before testing the connection.');
       return;
@@ -136,7 +139,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
   KeyApi get _keys => widget.keyApi ?? keyApi;
 
   Future<void> _scanSetupQr() async {
-    if (_saving || _scanning) {
+    if (_formBusy) {
       return;
     }
     setState(() => _scanning = true);
@@ -147,12 +150,66 @@ class _ConfigScreenState extends State<ConfigScreen> {
       }
       try {
         final payload = parseSetupQr(raw);
+        final incomingPrivateKey = payload.phonePrivateKey;
+        String? incomingPublicKey;
+        if (incomingPrivateKey != null) {
+          // Verify the full pair before changing ANY field or asking to replace
+          // existing keys. Shape checks alone cannot establish a usable pair.
+          try {
+            incomingPublicKey = await _keys.derive(incomingPrivateKey);
+          } catch (_) {
+            throw const FormatException('Invalid phone key pair');
+          }
+          if (!mounted) return;
+          if (incomingPublicKey != payload.phonePublicKey) {
+            throw const FormatException('Invalid phone key pair');
+          }
+          final currentPrivateKey = _privateKey.text.trim();
+          if (currentPrivateKey.isNotEmpty &&
+              currentPrivateKey != incomingPrivateKey) {
+            final overwrite = await showDialog<bool>(
+              context: context,
+              builder: (dialogContext) => AlertDialog(
+                title: const Text('Overwrite phone keys?'),
+                content: const Text(
+                  'This setup QR contains a different phone key pair. '
+                  'Overwrite the phone keys in this configuration?',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(false),
+                    child: const Text('No'),
+                  ),
+                  FilledButton(
+                    onPressed: () => Navigator.of(dialogContext).pop(true),
+                    child: const Text('Yes'),
+                  ),
+                ],
+              ),
+            );
+            if (!mounted || overwrite != true) return;
+          }
+          _deriveDebounce?.cancel();
+          _deriveRequest++;
+          _suppressPrivateKeyListener = true;
+          _privateKey.text = incomingPrivateKey;
+          _suppressPrivateKeyListener = false;
+          _publicKey.text = incomingPublicKey;
+          setState(() => _publicKeyHint = _hintReady);
+        }
         _address.text = payload.address;
         _peerPublicKey.text = payload.peerPublicKey;
         _presharedKey.text = payload.presharedKey ?? '';
         _endpoint.text = payload.endpoint;
         _mtu.text = '${payload.mtu}';
         _invalidateTestResult();
+
+        if (incomingPrivateKey != null) {
+          _showMessage(
+            'Router settings and phone keys loaded. Review, then Save.',
+          );
+          return;
+        }
 
         final privateKey = _privateKey.text.trim();
         if (privateKey.isEmpty) {
@@ -309,6 +366,8 @@ class _ConfigScreenState extends State<ConfigScreen> {
   }
 
   Future<void> _generateKeypair() async {
+    if (_formBusy) return;
+    setState(() => _generating = true);
     try {
       final pair = await _keys.generate();
       if (!mounted) {
@@ -328,6 +387,8 @@ class _ConfigScreenState extends State<ConfigScreen> {
         return;
       }
       _showMessage('Could not generate a key pair. Please try again.');
+    } finally {
+      if (mounted) setState(() => _generating = false);
     }
   }
 
@@ -344,6 +405,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
   }
 
   Future<void> _save() async {
+    if (_formBusy) return;
     // Refuse to reconfigure a running tunnel. (The alternative would be to stop
     // the bridge first; refusing keeps the user in control of their session.)
     if (widget.bridgeRunning()) {
@@ -355,14 +417,9 @@ class _ConfigScreenState extends State<ConfigScreen> {
       return;
     }
 
-    // Refresh the displayed public key on save, in case the user typed and hit
-    // Save before the debounce fired.
-    _deriveDebounce?.cancel();
-    await _derivePublicKey(_privateKey.text.trim());
-    if (!mounted) {
-      return;
-    }
-
+    // Snapshot the validated form synchronously, then hold the operation lock
+    // through derivation AND persistence. An earlier Save cannot persist values
+    // imported by a later QR scan.
     final config = BridgeConfig(
       privateKey: _privateKey.text.trim(),
       address: _address.text.trim(),
@@ -376,6 +433,9 @@ class _ConfigScreenState extends State<ConfigScreen> {
 
     setState(() => _saving = true);
     try {
+      _deriveDebounce?.cancel();
+      await _derivePublicKey(config.privateKey);
+      if (!mounted) return;
       await widget.store.save(config);
       if (!mounted) {
         return;
@@ -417,7 +477,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
               if (widget.scanSetupQr != null) ...[
                 OutlinedButton.icon(
                   key: const Key('config-scan-qr'),
-                  onPressed: _saving || _scanning ? null : _scanSetupQr,
+                  onPressed: _formBusy ? null : _scanSetupQr,
                   icon: const Icon(Icons.qr_code_scanner),
                   label: Text(_scanning ? 'Opening camera…' : 'Scan router QR'),
                 ),
@@ -439,7 +499,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
                 alignment: Alignment.centerLeft,
                 child: OutlinedButton.icon(
                   key: const Key('config-generate-keypair'),
-                  onPressed: _saving ? null : _generateKeypair,
+                  onPressed: _formBusy ? null : _generateKeypair,
                   icon: const Icon(Icons.vpn_key_outlined),
                   label: const Text('Generate key pair'),
                 ),
@@ -526,7 +586,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
               if (widget.testConnection != null) ...[
                 OutlinedButton.icon(
                   key: const Key('config-test-connection'),
-                  onPressed: _testing || _saving ? null : _testConnection,
+                  onPressed: _testing || _formBusy ? null : _testConnection,
                   icon: const Icon(Icons.network_check),
                   label: Text(
                     _testing
@@ -559,7 +619,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
               const SizedBox(width: 12),
               FilledButton(
                 key: const Key('config-save'),
-                onPressed: _saving ? null : _save,
+                onPressed: _formBusy ? null : _save,
                 child: const Text('Save'),
               ),
             ],
