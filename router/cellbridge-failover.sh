@@ -12,6 +12,73 @@ HEALTH_URLS='https://1.1.1.1/cdn-cgi/trace https://1.0.0.1/cdn-cgi/trace'
 
 log() { logger -t cellbridge-failover "$*"; }
 
+native_kmwan_ready() {
+	# A registered cell may be offline: no working backup is a valid state.
+	# What matters here is that the native monitor registered every enabled,
+	# currently up IPv4 member, not that it found internet on that member.
+	[ -r /proc/gl-kmwan/config ] || return 1
+	native_cells=$(cat /proc/gl-kmwan/config) || return 1
+	printf '%s\n' "$native_cells" | awk '
+		NF && $0 !~ /^[A-Za-z0-9_.-]+:(online|offline)$/ { exit 1 }
+	' || return 1
+	native_config=$(uci -q show kmwan) || return 1
+	for member in $(printf '%s\n' "$native_config" | awk -F'[.=]' '/=member$/ { print $2 }'); do
+		[ "$(uci -q get "kmwan.$member.disabled")" != 1 ] || continue
+		[ "$(uci -q get "kmwan.$member.addr_type")" = 4 ] || continue
+		native_iface=$(uci -q get "kmwan.$member.interface") || return 1
+		[ -n "$native_iface" ] || return 1
+		# A configured USB/modem interface need not exist while disconnected.
+		if native_status=$(ifstatus "$native_iface" 2>/dev/null); then
+			native_up=$(printf '%s\n' "$native_status" | jsonfilter -e '@.up') || return 1
+			case "$native_up" in
+				false) continue ;;
+				true) : ;;
+				*) return 1 ;;
+			esac
+		else
+			# Missing dynamic modem members are normal. Failure to inspect a
+			# configured, enabled interface is not evidence it is disconnected.
+			if [ -n "$(uci -q get "network.$native_iface")" ] &&
+				[ "$(uci -q get "network.$native_iface.disabled")" != 1 ]; then
+				return 1
+			fi
+			continue
+		fi
+		printf '%s\n' "$native_cells" | awk -F: -v iface="$native_iface" '
+			$1 == iface && ($2 == "online" || $2 == "offline") { found=1 }
+			END { exit !found }
+		' || return 1
+	done
+}
+
+restart_native_kmwan() {
+	if /etc/init.d/kmwan restart; then
+		return 0
+	else
+		native_rc=$?
+	fi
+	# Some vendor gen_weight_route versions end failover mode with:
+	#   [ "$ipv6_enable" = 1 ] && add_static_rt6
+	#   exit
+	# With IPv6 disabled, this returns 1 after successful IPv4 initialization.
+	# Bound the exception to that mode/code and verify actual registration.
+	[ "$native_rc" = 1 ] &&
+		[ "$(uci -q get kmwan.global.enable)" = 1 ] &&
+		[ "$(uci -q get kmwan.global.mode)" = failover ] &&
+		[ "$(uci -q get glipv6.globals.enabled)" = 0 ] || return "$native_rc"
+	command -v ifstatus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 || return "$native_rc"
+	native_attempt=0
+	while [ "$native_attempt" -lt 3 ]; do
+		if native_kmwan_ready; then
+			printf 'warning: kmwan returned 1 in IPv4 failover mode; runtime registration verified\n' >&2
+			return 0
+		fi
+		native_attempt=$((native_attempt + 1))
+		[ "$native_attempt" -ge 3 ] || sleep 1
+	done
+	return "$native_rc"
+}
+
 check_ownership() {
 	# Inspect all tables in one successful dump: a failed per-table lookup
 	# must not be confused with an empty table. -N avoids configured aliases.
@@ -124,5 +191,6 @@ case "${1:-run}" in
 	cleanup) cleanup ;;
 	check) check_ownership ;;
 	status) cat "$RUN_DIR/status" ;;
-	*) printf 'Usage: %s [run|cleanup|check|status]\n' "$0" >&2; exit 1 ;;
+	restart-kmwan) restart_native_kmwan ;;
+	*) printf 'Usage: %s [run|cleanup|check|status|restart-kmwan]\n' "$0" >&2; exit 1 ;;
 esac

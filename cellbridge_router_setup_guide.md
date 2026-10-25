@@ -14,6 +14,9 @@ verification and revert procedure. This supersedes the old fail-closed setup.
 2. Copy all three scripts from `router/`: setup, revert and failover.
 3. Keep LAN SSH open and run `sh /root/cellbridge-setup.sh`. It generates/reuses
    both router and phone key pairs; no phone public-key copy/paste is needed.
+   Setup stops before changing anything if UDP 51820 is already used (for
+   example by GL.iNet's `wgserver`); choose another port with
+   `sh /root/cellbridge-setup.sh --port 51830`.
 4. After setup finishes, switch the phone from hotspot to the router's Wi-Fi
    client connection, leaving mobile data enabled.
 5. Scan the printed setup QR. If it would replace different existing phone keys,
@@ -29,7 +32,7 @@ verification and revert procedure. This supersedes the old fail-closed setup.
 | Address | `10.10.10.2/24` |
 | Peer public key | Router public key printed by setup |
 | Preshared key | Generated/reused by setup; included in QR |
-| Endpoint | The router's detected LAN address, UDP port `51820` |
+| Endpoint | The router's detected LAN address and setup's WireGuard UDP port (default `51820`, or `--port PORT`) |
 | MTU | `1420` |
 
 ## Backups and recovery

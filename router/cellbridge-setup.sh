@@ -11,8 +11,9 @@
 #                          v
 #                      [Internet]
 #
-# The router is the WireGuard *server* (wg0, 10.10.10.1/24, UDP 51820).  The
-# phone is the only peer (10.10.10.2/24) and the *initiator*: it is a Wi-Fi
+# The router is the WireGuard *server* (wg0, 10.10.10.1/24, UDP 51820 by
+# default; use --port if 51820 is already used by another WireGuard service).
+# The phone is the only peer (10.10.10.2/24) and the *initiator*: it is a Wi-Fi
 # client of this router, so no static DHCP lease or fixed LAN address is
 # needed.  The router sends the LAN's default traffic into the tunnel and
 # masquerades it, so the phone sees every LAN client as 10.10.10.1.
@@ -41,6 +42,8 @@
 #                            default 1.1.1.1)
 #   --wan-iface NAME         extra backup UCI interface (repeatable);
 #                            normally auto-detected
+#   --port PORT              WireGuard UDP port (default 51820; re-runs reuse
+#                            the port already configured on wg0)
 #   --keep-wan               accepted for compatibility; backups now stay on
 #   -h, --help               this text
 #
@@ -65,6 +68,7 @@ WG_IF=wg0
 WG_ADDR=10.10.10.1/24
 WG_ADDR_HOST=10.10.10.1
 WG_PORT=51820
+WG_PORT_EXPLICIT=0
 WG_MTU=1420
 PHONE_ADDR=10.10.10.2/24
 DEFAULT_DNS=1.1.1.1
@@ -92,6 +96,55 @@ is_wireguard_key() {
 	return 0
 }
 
+wg0_link_up() {
+	ip link show "$WG_IF" 2>/dev/null |
+		head -n 1 |
+		sed -n 's/.*<\([^>]*\)>.*/\1/p' |
+		tr ',' '\n' |
+		grep -qx UP
+}
+
+udp_port_listening() {
+	_port=$1
+	_hex=$(printf '%04X' "$_port" 2>/dev/null) || return 1
+	for _table in /proc/net/udp /proc/net/udp6; do
+		[ -r "$_table" ] || continue
+		awk -v hex="$_hex" '
+			NR > 1 {
+				n = split($2, parts, ":")
+				if (n > 1 && toupper(parts[n]) == hex) { found = 1; exit }
+			}
+			END { exit !found }
+		' "$_table" && return 0
+	done
+	return 1
+}
+
+wg0_owns_udp_port() {
+	wg0_link_up &&
+		[ "$(wg show "$WG_IF" listen-port 2>/dev/null)" = "$WG_PORT" ]
+}
+
+other_wg_port_owners() {
+	command -v wg >/dev/null 2>&1 || return 0
+	for _iface in $(wg show interfaces 2>/dev/null); do
+		[ "$_iface" = "$WG_IF" ] && continue
+		[ "$(wg show "$_iface" listen-port 2>/dev/null)" = "$WG_PORT" ] &&
+			printf '%s\n' "$_iface"
+	done
+}
+
+check_wg_port_available() {
+	udp_port_listening "$WG_PORT" || return 0
+	wg0_owns_udp_port && return 0
+	_owners=$(other_wg_port_owners)
+	if [ -n "$_owners" ]; then
+		_owner_list=$(printf '%s' "$_owners" | tr '\n' ' ')
+		die "UDP $WG_PORT is already used by WireGuard interface(s): ${_owner_list% }; rerun with --port PORT"
+	fi
+	die "UDP $WG_PORT is already in use; rerun with --port PORT"
+}
+
 usage() {
 	cat <<'EOF'
 CellBridge router setup (GL.iNet Flint 3 / OpenWrt fw4)
@@ -103,8 +156,13 @@ Options:
   --phone-public-key KEY   optional phone-managed public key (skip generation)
   --dns ADDR               upstream resolver (repeatable, default 1.1.1.1)
   --wan-iface NAME         extra backup UCI interface (repeatable)
+  --port PORT              WireGuard UDP port (default 51820)
   --keep-wan               compatibility option; backups now always stay on
   -h, --help               show this help
+
+Re-runs reuse the port already configured on wg0 unless --port is given. If the
+chosen port is occupied, setup stops before changing anything and tells you to
+choose another with --port.
 
 Default: generate/reuse phone keys and import them by scanning the QR. The app
 asks Yes/No before overwriting different existing phone keys. Save applies them.
@@ -163,6 +221,17 @@ while [ $# -gt 0 ]; do
 		WAN_OVERRIDES="$WAN_OVERRIDES ${1#*=}"
 		shift
 		;;
+	--port)
+		[ $# -ge 2 ] || die "--port needs a value"
+		WG_PORT=$2
+		WG_PORT_EXPLICIT=1
+		shift 2
+		;;
+	--port=*)
+		WG_PORT=${1#*=}
+		WG_PORT_EXPLICIT=1
+		shift
+		;;
 	--keep-wan)
 		shift
 		;;
@@ -178,6 +247,12 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$DNS_LIST" ] || DNS_LIST=$DEFAULT_DNS
+
+case "$WG_PORT" in
+	''|*[!0-9]*) die "--port must be a number between 1 and 65535" ;;
+esac
+[ "$WG_PORT" -ge 1 ] && [ "$WG_PORT" -le 65535 ] ||
+	die "--port must be a number between 1 and 65535"
 
 # Strip whitespace the operator may have pasted along with the key.
 PHONE_PUB=$(printf '%s' "$PHONE_PUB" | tr -d '[:space:]')
@@ -410,8 +485,24 @@ take_snapshot() {
 	chmod 600 "$STATE_DIR/snapshot-complete" 2>/dev/null || true
 }
 
+# Keep the QR endpoint stable on re-runs. An explicit --port always wins.
+if [ "$WG_PORT_EXPLICIT" = 0 ]; then
+	existing_port=$(uci -q get "network.$WG_IF.listen_port")
+	case "$existing_port" in
+		''|*[!0-9]*) : ;;
+		*)
+			if [ "$existing_port" -ge 1 ] && [ "$existing_port" -le 65535 ]; then
+				WG_PORT=$existing_port
+			fi
+			;;
+	esac
+fi
+
 msg "== CellBridge setup =="
+msg "WireGuard UDP port: $WG_PORT"
 msg "Snapshot directory: $STATE_DIR"
+# Refuse a conflicting listener before the snapshot and before any config edit.
+check_wg_port_available
 take_snapshot
 
 if [ -n "$WAN_SECTIONS" ]; then
@@ -778,19 +869,28 @@ install_failover_monitor
 
 # Reload the network and wait until the tunnel address exists.  This is the
 # cheap check that netifd, wireguard-tools and the kernel module all agree.
+wg0_ready() {
+	ip -4 addr show dev "$WG_IF" 2>/dev/null |
+		grep -q "$WG_ADDR_HOST/" &&
+		wg0_link_up &&
+		[ "$(wg show "$WG_IF" listen-port 2>/dev/null)" = "$WG_PORT" ]
+}
+
 bring_up_wg() {
 	/etc/init.d/network reload >/dev/null 2>&1 || true
 
-	# A brand-new interface is sometimes not brought up by a reload alone.
-	if ! ip link show "$WG_IF" >/dev/null 2>&1; then
-		ifup "$WG_IF" >/dev/null 2>&1 || true
-	fi
+	# An address can exist while the link is still down (for example when the
+	# UDP port was rejected). ifup also repairs netifd's stale "up" state.
+	wg0_link_up || ifup "$WG_IF" >/dev/null 2>&1 || true
 
 	i=0
 	while [ "$i" -lt 15 ]; do
-		if ip -4 addr show dev "$WG_IF" 2>/dev/null |
-			grep -q "$WG_ADDR_HOST/"; then
+		if wg0_ready; then
 			return 0
+		fi
+		# A changed port or a stale device may need one explicit re-up.
+		if [ "$i" = 2 ]; then
+			ifup "$WG_IF" >/dev/null 2>&1 || true
 		fi
 		sleep 1
 		i=$((i + 1))
@@ -800,7 +900,9 @@ bring_up_wg() {
 
 msg "Reloading the network"
 if ! bring_up_wg; then
-	warn "wg0 did not get $WG_ADDR within 15s"
+	warn "$WG_IF did not become ready (address, link, UDP $WG_PORT) within 15s"
+	warn "wg0 link: $(ip link show "$WG_IF" 2>/dev/null | head -n 1)"
+	warn "wg0 listen-port: $(wg show "$WG_IF" listen-port 2>/dev/null)"
 	warn "recent WireGuard/interface log lines:"
 	logread 2>/dev/null | grep -i -E 'wireguard|wg0|netifd' | tail -n 8 >&2 || true
 	die "$WG_IF did not come up; backups remain enabled; run cellbridge-revert.sh to restore"
@@ -835,7 +937,7 @@ fi
 # Keep the native physical-uplink controller and start tunnel health routing.
 # ---------------------------------------------------------------------------
 
-/etc/init.d/kmwan restart || die "kmwan restart failed; run revert to restore"
+"$MONITOR" restart-kmwan || die "kmwan restart failed runtime checks; run revert to restore"
 "$MONITOR_INIT" start || die "cannot start tunnel monitor; run revert to restore"
 
 # ---------------------------------------------------------------------------

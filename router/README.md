@@ -52,6 +52,26 @@ optional `qrencode` before changing routing. Missing mandatory dependencies abor
 setup. Setup does **not** disable the WAN. `--keep-wan` is still accepted for
 compatibility, but keeping backup uplinks is now the default behaviour.
 
+Setup defaults to UDP **51820**. Before taking a snapshot or editing config it
+checks whether another WireGuard interface or UDP service already owns that port
+(for example GL.iNet's `wgserver`, which also defaults to 51820). A conflict is a
+hard error naming the owner; choose another port with `--port`:
+
+```sh
+sh /root/cellbridge-setup.sh --port 51830
+```
+
+Re-runs reuse the port already configured on `wg0` unless `--port` is supplied, so
+the QR endpoint remains stable. After applying the network reload, setup verifies
+the interface has its address, is administratively UP, and has the expected listen
+port. An existing address on a DOWN interface is not accepted.
+
+Some GL.iNet firmware versions return exit status 1 from a successful IPv4 kmwan
+restart when IPv6 is disabled. Setup and revert handle that specific status/mode
+only after checking that the native engine is readable and currently up IPv4
+members are registered. Other exit codes or failed runtime checks remain errors;
+revert retains its snapshot on failure. No firmware scripts are modified.
+
 Options:
 
 | Option | Effect |
@@ -59,6 +79,7 @@ Options:
 | `--phone-public-key KEY` | Optional: use an existing phone-managed key instead of generating/importing phone keys |
 | `--dns ADDR` | Repeatable public DNS upstream; default `1.1.1.1` |
 | `--wan-iface NAME` | Extra backup UCI interface for snapshot/recovery bookkeeping |
+| `--port PORT` | WireGuard UDP port; default `51820`, re-runs reuse the existing `wg0` port |
 | `--keep-wan` | Compatibility option; backups always stay enabled |
 | `--help` | Print usage |
 
@@ -143,7 +164,7 @@ have established that its originals are safely recoverable.
 
 | Area | Change |
 |---|---|
-| Network | `wg0`, `10.10.10.1/24`, UDP 51820, MTU 1420; one phone peer |
+| Network | `wg0`, `10.10.10.1/24`, UDP 51820 by default (configurable), MTU 1420; one phone peer |
 | Routing | Health-controlled policy tables instead of an unconditional tunnel default |
 | Firewall | `vpn` zone for `wg0`, masquerade, MSS clamping, `lan → vpn` forwarding |
 | DNS | Public resolvers via whichever IPv4 path is selected |
@@ -165,7 +186,11 @@ preserved. Dependencies installed by setup are left installed by revert.
 On the router:
 
 ```sh
-wg show wg0
+ip link show wg0
+wg show wg0 listen-port
+wg show wg0 latest-handshakes
+wg show wg0 endpoints
+wg show wg0 transfer
 /usr/sbin/cellbridge-failover status
 ip -4 rule show
 ip -4 route show table 51820
@@ -174,7 +199,9 @@ cat /proc/gl-kmwan/config
 logread -e cellbridge-failover
 ```
 
-Expected with working CellBridge: a recent WireGuard handshake, `path=tunnel`,
+`wg0` must show `UP` and a listener on the port in the QR. A DOWN interface with
+an address is not ready. Expected with working CellBridge: a recent WireGuard
+handshake, `path=tunnel`,
 and a default via `wg0` in table 51820. Table 51821 contains the tunnel probe
 default and an unreachable guard. Main-table physical-uplink routes stay present.
 

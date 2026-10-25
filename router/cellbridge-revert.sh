@@ -158,7 +158,14 @@ reload_services() {
 	[ "$net_ok" = 1 ] || warn "network reload returned an error"
 	bring_wan_up
 	if [ -x /etc/init.d/kmwan ]; then
-		/etc/init.d/kmwan restart >/dev/null 2>&1 || {
+		# The installed monitor was removed before restoring configs; use the
+		# supplied companion for the vendor's IPv6-disabled exit-code quirk.
+		kmwan_helper=$SCRIPT_DIR/cellbridge-failover.sh
+		if [ -f "$kmwan_helper" ]; then
+			sh "$kmwan_helper" restart-kmwan >/dev/null 2>&1
+		else
+			/etc/init.d/kmwan restart >/dev/null 2>&1
+		fi || {
 			warn "kmwan restart failed; keeping backups for a retry"
 			return 1
 		}
