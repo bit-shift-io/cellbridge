@@ -4,7 +4,7 @@
 # Undoes cellbridge-setup.sh:
 #   * restores /etc/config/{network,firewall,dhcp} from the snapshot taken by
 #     the setup script (/etc/cellbridge-backup), or
-#   * if no usable snapshot exists, removes what setup added (wg0, its peer,
+#   * if no snapshot exists, removes what setup added (wg0, its peer,
 #     the "vpn" zone, the lan->vpn forwarding, the DNS override) and re-enables
 #     the WAN interface(s).
 #
@@ -12,8 +12,8 @@
 # therefore keeps it when a restore fails, and only deletes it after a
 # successful restore.
 #
-# IMPORTANT: this is the manual recovery path.  The LAN is fail-closed: with
-# the phone away there is no internet.  Run this over SSH on the LAN
+# Stops/removes the tunnel health monitor and its policy routing, restores
+# original kmwan priorities as well as network/firewall/DNS. Run over LAN SSH
 # (ssh root@192.168.8.1), which stays reachable in either state.
 #
 # Usage:
@@ -29,6 +29,11 @@ WG_IF=wg0
 WG_LISTEN_PORT=51820
 WG_ADDR=10.10.10.1/24
 DEFAULT_DNS=1.1.1.1
+MONITOR=/usr/sbin/cellbridge-failover
+MONITOR_INIT=/etc/init.d/cellbridge-failover
+INSTALL_MARKER=/etc/cellbridge-installed
+RESTORED_MARKER=/etc/cellbridge-restored
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd) || exit 1
 
 msg()  { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -42,7 +47,8 @@ Usage:
   sh cellbridge-revert.sh
 
 Restores the snapshot in /etc/cellbridge-backup, or removes the CellBridge
-configuration if no snapshot exists.  Re-enables the old WAN uplink.
+configuration if no snapshot exists. Stops tunnel health routing and restores
+the original kmwan configuration and WAN uplinks.
 EOF
 }
 
@@ -140,24 +146,108 @@ reload_services() {
 	net_ok=1
 	/etc/init.d/network reload >/dev/null 2>&1 || net_ok=0
 	if command -v fw4 >/dev/null 2>&1; then
-		fw4 reload >/dev/null 2>&1 || warn "fw4 reload returned an error"
+		fw4 reload >/dev/null 2>&1 || { warn "fw4 reload returned an error"; net_ok=0; }
 	else
 		/etc/init.d/firewall reload >/dev/null 2>&1 ||
-			warn "firewall reload returned an error"
+			{ warn "firewall reload returned an error"; net_ok=0; }
 	fi
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1 ||
-		warn "dnsmasq restart returned an error"
+		{ warn "dnsmasq restart returned an error"; net_ok=0; }
 	[ "$net_ok" = 1 ] || warn "network reload returned an error"
 	bring_wan_up
+	if [ -x /etc/init.d/kmwan ]; then
+		/etc/init.d/kmwan restart >/dev/null 2>&1 || {
+			warn "kmwan restart failed; keeping backups for a retry"
+			return 1
+		}
+	fi
+	[ "$net_ok" = 1 ]
 }
 
-# All three configs present => a usable setup-time snapshot.
+# Require a completed snapshot and all metadata/payloads for its format.
 snapshot_is_usable() {
 	[ -d "$STATE_DIR" ] || return 1
+	[ -f "$STATE_DIR/snapshot-complete" ] || return 1
+	if [ -f "$STATE_DIR/snapshot-version" ]; then
+		[ "$(cat "$STATE_DIR/snapshot-version")" = 2 ] || return 1
+		for item in kmwan-snapshot managed-files-snapshot failover-enabled failover-running; do
+			[ -f "$STATE_DIR/$item" ] || return 1
+		done
+		[ "$(cat "$STATE_DIR/snapshot-complete")" = complete ] &&
+			[ "$(cat "$STATE_DIR/managed-files-snapshot")" = complete ] || return 1
+		case "$(cat "$STATE_DIR/kmwan-snapshot")" in present|absent) : ;; *) return 1 ;; esac
+		for item in failover-enabled failover-running; do
+			grep -qx '[01]' "$STATE_DIR/$item" || return 1
+		done
+	elif [ -e "$INSTALL_MARKER" ] || [ -e "$MONITOR" ] || [ -e "$MONITOR_INIT" ]; then
+		return 1
+	fi
 	for cfg in network firewall dhcp; do
 		[ -f "$STATE_DIR/$cfg" ] || return 1
 	done
+	if [ -f "$STATE_DIR/kmwan-snapshot" ] &&
+		[ "$(cat "$STATE_DIR/kmwan-snapshot")" = present ]; then
+		[ -f "$STATE_DIR/kmwan" ] || return 1
+	fi
+	if [ -f "$STATE_DIR/managed-files-snapshot" ]; then
+		for item in failover-worker failover-init; do
+			if [ -f "$STATE_DIR/$item" ] && [ -f "$STATE_DIR/$item-absent" ]; then return 1; fi
+			[ -f "$STATE_DIR/$item" ] || [ -f "$STATE_DIR/$item-absent" ] || return 1
+		done
+		[ -f "$STATE_DIR/failover-enabled" ] || return 1
+	fi
 	return 0
+}
+
+stop_remove_failover() {
+	owned=0
+	for path in "$MONITOR" "$MONITOR_INIT"; do
+		[ -e "$path" ] || continue
+		grep -q 'CellBridge-managed' "$path" || {
+			warn "refusing to remove an unrelated file: $path"
+			return 1
+		}
+		owned=1
+	done
+	[ "$owned" = 1 ] || return 0
+	# Prefer the companion supplied beside revert. It also recovers a partial
+	# installation missing its installed worker, without guessing table ownership.
+	cleanup_tool=$SCRIPT_DIR/cellbridge-failover.sh
+	[ -f "$cleanup_tool" ] || cleanup_tool=$MONITOR
+	[ -f "$cleanup_tool" ] && grep -q 'CellBridge-managed' "$cleanup_tool" || {
+		warn "need cellbridge-failover.sh beside revert for safe routing cleanup"
+		return 1
+	}
+	sh "$cleanup_tool" check || return 1
+	if [ -x "$MONITOR_INIT" ]; then
+		"$MONITOR_INIT" stop || return 1
+		"$MONITOR_INIT" disable || return 1
+	fi
+	sh "$cleanup_tool" cleanup || return 1
+	rm -f "$MONITOR" "$MONITOR_INIT" || return 1
+	rm -f /var/run/cellbridge-failover/status /var/run/cellbridge-failover/status.new
+	msg "Stopped and removed CellBridge tunnel health routing"
+}
+
+restore_managed_files() {
+	[ -f "$STATE_DIR/managed-files-snapshot" ] || return 0
+	for item in failover-worker failover-init; do
+		case "$item" in
+			failover-worker) path=$MONITOR ;;
+			failover-init) path=$MONITOR_INIT ;;
+		esac
+		if [ -f "$STATE_DIR/$item" ]; then
+			cp "$STATE_DIR/$item" "$path" || return 1
+			chmod 700 "$path" || return 1
+			cmp -s "$STATE_DIR/$item" "$path" || return 1
+		fi
+	done
+	if [ -x "$MONITOR_INIT" ] && [ "$(cat "$STATE_DIR/failover-enabled")" = 1 ]; then
+		"$MONITOR_INIT" enable || return 1
+	fi
+	if [ -x "$MONITOR_INIT" ] && [ "$(cat "$STATE_DIR/failover-running")" = 1 ]; then
+		"$MONITOR_INIT" start || return 1
+	fi
 }
 
 # Is network.wg0 the interface this project creates?  Requiring the tunnel
@@ -174,6 +264,9 @@ is_cellbridge_wg0() {
 # (no-snapshot) cleanup has anything to do.  This is what makes a second run
 # after a successful restore a no-op instead of guessing.
 has_artifacts() {
+	for path in "$MONITOR" "$MONITOR_INIT"; do
+		[ ! -f "$path" ] || ! grep -q 'CellBridge-managed' "$path" || return 0
+	done
 	is_cellbridge_wg0 && return 0
 
 	# A wg0 that is not ours: leave it and its firewall references alone.
@@ -212,10 +305,13 @@ restore_snapshot() {
 	uci -q revert network >/dev/null 2>&1 || true
 	uci -q revert firewall >/dev/null 2>&1 || true
 	uci -q revert dhcp >/dev/null 2>&1 || true
+	uci -q revert kmwan >/dev/null 2>&1 || true
 
 	msg "Restoring /etc/config/{network,firewall,dhcp} from $STATE_DIR"
 	ok=1
-	for cfg in network firewall dhcp; do
+	configs='network firewall dhcp'
+	[ ! -f "$STATE_DIR/kmwan" ] || configs="$configs kmwan"
+	for cfg in $configs; do
 		cp "$STATE_DIR/$cfg" "/etc/config/$cfg" || {
 			warn "failed to restore /etc/config/$cfg"
 			ok=0
@@ -226,7 +322,7 @@ restore_snapshot() {
 	[ "$ok" = 1 ] || return 1
 
 	if command -v cmp >/dev/null 2>&1; then
-		for cfg in network firewall dhcp; do
+		for cfg in $configs; do
 			cmp -s "$STATE_DIR/$cfg" "/etc/config/$cfg" || {
 				warn "/etc/config/$cfg does not match the snapshot"
 				ok=0
@@ -235,7 +331,8 @@ restore_snapshot() {
 	fi
 	[ "$ok" = 1 ] || return 1
 
-	reload_services
+	reload_services || return 1
+	restore_managed_files || return 1
 
 	# wg0 should disappear with the restored network config, unless it was
 	# part of the original configuration.
@@ -355,7 +452,7 @@ cleanup_without_snapshot() {
 	fi
 	uci commit dhcp >/dev/null 2>&1 || warn "uci commit dhcp failed"
 
-	reload_services
+	reload_services || return 1
 
 	# Verify that the tunnel config is gone.
 	if [ -n "$(uci -q get "network.$WG_IF")" ]; then
@@ -379,10 +476,18 @@ cleanup_without_snapshot() {
 
 msg "== CellBridge revert =="
 
+if [ ! -d "$STATE_DIR" ] && [ ! -e "$INSTALL_MARKER" ] && [ -f "$RESTORED_MARKER" ]; then
+	msg "This installation was already reverted; leaving the restored original state untouched."
+	exit 0
+fi
 if snapshot_is_usable; then
 	msg "Found snapshot in $STATE_DIR"
+	stop_remove_failover || die "cannot stop/remove the monitor; keeping backups"
 	if restore_snapshot; then
-		msg "Restored the previous network, firewall and DNS configuration."
+		msg "Restored the previous network, firewall, DNS and kmwan configuration."
+		printf '2\n' > "$RESTORED_MARKER.new" && mv "$RESTORED_MARKER.new" "$RESTORED_MARKER" ||
+			die "cannot record successful restore; keeping backups"
+		rm -f "$INSTALL_MARKER" || die "cannot clear installation marker; keeping backups"
 		if [ -d "$STATE_DIR" ]; then
 			rm -rf "$STATE_DIR" || warn "could not remove $STATE_DIR"
 		fi
@@ -397,10 +502,13 @@ if snapshot_is_usable; then
 		print_wan_state
 		exit 1
 	fi
+elif [ -d "$STATE_DIR" ]; then
+	die "snapshot is incomplete or damaged; keeping it and refusing a guessed restore"
 elif has_artifacts; then
 	if [ -d "$STATE_DIR" ]; then
 		warn "$STATE_DIR exists but is incomplete; keeping it untouched"
 	fi
+	stop_remove_failover || die "cannot stop/remove the monitor; keeping backups"
 	if cleanup_without_snapshot; then
 		msg "Removed the CellBridge configuration."
 	else

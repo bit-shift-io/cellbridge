@@ -21,8 +21,9 @@ the phone re-originates it on its cellular radio.
 LAN clients ──▶ Flint 3 ──WireGuard over Wi-Fi──▶ Phone ──▶ Cellular ──▶ Internet
 ```
 
-- The **router** treats the phone as its upstream: the LAN's `0.0.0.0/0` is routed into
-  the WireGuard peer and masqueraded.
+- The **router** prefers verified internet through the phone's WireGuard tunnel,
+  with masquerading. Existing GL.iNet kmwan provides USB-tether then WAN fallback;
+  the router automatically returns to CellBridge when tunnel internet recovers.
 - The **phone** terminates the tunnel in Rust (`boringtun`) and runs a userspace IPv4
   gateway (`smoltcp`) that terminates TCP and rewrites UDP, re-originating every flow on
   ordinary sockets bound to the cellular network.
@@ -37,7 +38,7 @@ Because the phone originates the connections itself, **no root is required** and
 | **Works** | All TCP and UDP ports — browsing, QUIC, DNS, games, VoIP, torrents |
 | **Best-effort** | ICMP echo to the internet |
 | **Out of scope** | Raw protocols (GRE/ESP), IPv6, root, USB/Bluetooth tethering |
-| **Fail-closed** | If the phone is absent the LAN has no internet — by design |
+| **Fallback** | Prefer healthy CellBridge, then USB tether, then WAN; no internet if none works |
 
 ## Project structure
 

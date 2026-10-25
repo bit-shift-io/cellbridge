@@ -1,0 +1,385 @@
+"""Sandbox the complete setup/revert scripts; never execute router operations.
+
+Only filesystem roots and external OpenWrt commands are replaced. Config files
+use JSON fixtures understood by the UCI boundary double, so backups/restores use
+real files and can be checked byte-for-byte.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+ROUTER = Path(__file__).resolve().parents[1]
+KEY = "A" * 43 + "="
+
+OPENWRT_COMMAND = r'''#!/usr/bin/env python3
+import json, os, pathlib, re, subprocess, sys
+root = pathlib.Path(os.environ["SANDBOX"])
+cmd, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
+with (root / "events").open("a") as out:
+    out.write(cmd + " " + " ".join(args) + "\n")
+cfgdir = root / "etc/config"
+if cmd == "uci":
+    while args and args[0].startswith("-"):
+        option = args.pop(0)
+        if option == "-c":
+            cfgdir = pathlib.Path(args.pop(0))
+    op = args.pop(0)
+    if op == "batch":
+        # Keys are passed on stdin, as in real setup (not logged here).
+        line = sys.stdin.read().strip()
+        op, value = line.split(" ", 1)
+        args = [value.replace("'", "")]
+    if op in ("commit", "revert"):
+        sys.exit(0)
+    path, _, value = args[0].partition("=")
+    parts = path.split(".")
+    name = parts.pop(0)
+    file = cfgdir / name
+    data = json.loads(file.read_text()) if file.exists() else {}
+    def resolve(section):
+        match = re.fullmatch(r"@(\w+)\[(\d+)\]", section)
+        if not match:
+            return section
+        matches = [k for k, v in data.items() if v["_type"] == match[1]]
+        try:
+            return matches[int(match[2])]
+        except IndexError:
+            sys.exit(1)
+    sec = resolve(parts[0]) if parts else None
+    field = parts[1] if len(parts) > 1 else "_type"
+    if op == "get":
+        try:
+            got = data[sec][field]
+        except KeyError:
+            sys.exit(1)
+        print(" ".join(got) if isinstance(got, list) else got)
+    elif op == "show":
+        for s, fields in data.items():
+            print(f"{name}.{s}={fields['_type']}")
+            for f, v in fields.items():
+                if f != "_type":
+                    print(f"{name}.{s}.{f}=" + repr(" ".join(v) if isinstance(v, list) else v))
+    elif op == "add":
+        sec = "cfg" + str(len(data))
+        while sec in data:
+            sec += "x"
+        data[sec] = {"_type": args[1]}
+        print(sec)
+    elif op == "set":
+        data.setdefault(sec, {})[field] = value
+    elif op == "delete":
+        try:
+            if field == "_type":
+                del data[sec]
+            else:
+                del data[sec][field]
+        except KeyError:
+            sys.exit(1)
+    elif op == "add_list":
+        old = data[sec].get(field, [])
+        data[sec][field] = (old if isinstance(old, list) else [old]) + [value]
+    elif op == "del_list":
+        data[sec][field].remove(value)
+    else:
+        raise RuntimeError((op, args))
+    if op not in ("get", "show"):
+        file.write_text(json.dumps(data))
+elif cmd == "cp":
+    if os.environ.get("FAIL_BACKUP_COPY") == "1" and "cellbridge-backup/network" in args[-1]:
+        pathlib.Path(args[-1]).write_text("partial copy")
+        sys.exit(1)
+    sys.exit(subprocess.run(["/usr/bin/cp", *args]).returncode)
+elif cmd == "ip":
+    if args == ["-Version"]:
+        print("ip utility, iproute2-test")
+    elif "rule" in args and "del" in args:
+        sys.exit(2)
+    elif args[:2] == ["link", "show"]:
+        data = json.loads((cfgdir / "network").read_text())
+        sys.exit(0 if "wg0" in data else 1)
+    elif args[:3] == ["-4", "addr", "show"]:
+        print("inet 10.10.10.1/24")
+    elif "show" in args and "table" in args:
+        if os.environ.get("ROUTE_INSPECTION_FAILURE") == "1":
+            sys.exit(1)
+        if os.environ.get("ROUTE_CONFLICT") == "1":
+            print("default via 192.0.2.1 dev uplink table 51820 proto 4")
+elif cmd == "wg":
+    if args[0] in ("genkey", "genpsk"):
+        print("A" * 43 + "=")
+    elif args[0] == "pubkey":
+        sys.stdin.read()
+        print("B" * 43 + "=")
+    elif args[0] == "show":
+        print("B" * 43 + "=")
+elif cmd == "id":
+    print("0")
+elif cmd == "qrencode":
+    sys.stdin.read()
+    print("[QR]")
+elif cmd == "opkg":
+    sys.exit(1)  # Tests use existing dependencies; no installation is allowed.
+elif cmd == "fw4":
+    if os.environ.get("FAIL_FIREWALL_RELOAD") == "1":
+        sys.exit(1)
+elif cmd in ("ifup", "ifdown", "modprobe", "curl", "logger", "logread"):
+    pass
+else:
+    raise RuntimeError((cmd, args))
+'''
+
+
+class InstallationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        for directory in ("etc/config", "etc/init.d", "etc/ssl/certs", "usr/sbin", "input", "bin", "var/run"):
+            (self.root / directory).mkdir(parents=True, exist_ok=True)
+        originals = {
+            "network": {
+                "lan": {"_type": "interface", "proto": "static", "ipaddr": "192.0.2.1"},
+                "wan": {"_type": "interface", "proto": "dhcp", "metric": "1"},
+                "tethering": {"_type": "interface", "proto": "dhcp", "metric": "9"},
+            },
+            "firewall": {"lan_zone": {"_type": "zone", "name": "lan", "input": "ACCEPT"}},
+            "dhcp": {"dns": {"_type": "dnsmasq", "server": ["192.0.2.53"]}},
+            "kmwan": {
+                "global": {"_type": "global", "enable": "1", "mode": "failover"},
+                "usb": {"_type": "member", "interface": "tethering", "addr_type": "4", "metric": "9"},
+                "wired": {"_type": "member", "interface": "wan", "addr_type": "4", "metric": "1"},
+            },
+        }
+        self.originals = {}
+        for name, value in originals.items():
+            data = json.dumps(value).encode()
+            (self.root / "etc/config" / name).write_bytes(data)
+            self.originals[name] = data
+        (self.root / "etc/ssl/certs/ca-certificates.crt").write_text("fixture CA bundle")
+        self.env = {**os.environ, "SANDBOX": str(self.root),
+                    "PATH": f"{self.root / 'bin'}:{os.environ['PATH']}"}
+        for cmd in ("uci", "cp", "ip", "wg", "id", "qrencode", "opkg", "ifup", "ifdown", "fw4", "modprobe", "curl", "logger", "logread"):
+            path = self.root / "bin" / cmd
+            path.write_text(OPENWRT_COMMAND)
+            path.chmod(0o755)
+        for service in ("network", "dnsmasq", "kmwan", "firewall"):
+            path = self.root / "etc/init.d" / service
+            path.write_text('''#!/bin/sh
+printf '%s %s\n' "$0" "$*" >> "$SANDBOX/events"
+case "$0:$1" in
+ */kmwan:restart) test "${FAIL_KMWAN_RESTART:-0}" != 1 || exit 1 ;;
+esac
+''')
+            path.chmod(0o755)
+        # Model the procd command boundary, not its own implementation.
+        rc = self.root / "etc/rc.common"
+        rc.write_text('''#!/bin/sh
+printf 'service %s %s\n' "$1" "$2" >> "$SANDBOX/events"
+case "$2" in
+ enable) touch "$SANDBOX/service-enabled" ;;
+ disable) rm -f "$SANDBOX/service-enabled" ;;
+ enabled) test -f "$SANDBOX/service-enabled" ;;
+ start) touch "$SANDBOX/service-running" ;;
+ running) test -f "$SANDBOX/service-running" ;;
+ stop)
+  rm -f "$SANDBOX/service-running"
+  . "$1"
+  if command -v service_stopped >/dev/null 2>&1; then service_stopped; fi
+  ;;
+esac
+''')
+        rc.chmod(0o755)
+        for file in ROUTER.glob("cellbridge-*.sh"):
+            text = file.read_text()
+            for prefix in ("/etc/", "/usr/sbin/", "/var/run/"):
+                text = text.replace(prefix, f"{self.root}{prefix}")
+            target = self.root / "input" / file.name
+            target.write_text(text)
+            target.chmod(0o755)
+
+    def run_script(self, name, *args, success=True):
+        result = subprocess.run(["sh", str(self.root / "input" / name), *args],
+                                env=self.env, capture_output=True, text=True, timeout=20)
+        if success:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0)
+        return result
+
+    def setup_router(self):
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY)
+
+    def config(self, name):
+        return json.loads((self.root / "etc/config" / name).read_text())
+
+    def test_setup_preserves_first_backup_and_revert_restores_every_configuration(self):
+        self.setup_router()
+        self.assertTrue((self.root / "service-enabled").exists())
+        for name, data in self.originals.items():
+            backup = self.root / "etc/cellbridge-backup" / name
+            self.assertEqual(backup.read_bytes(), data)
+            self.assertEqual(backup.stat().st_mode & 0o077, 0)
+        self.assertEqual(self.config("network")["wan"].get("disabled", "0"), "0")
+        self.assertEqual(self.config("network")["tethering"]["metric"], "1")
+        self.assertEqual(self.config("network")["wan"]["metric"], "2")
+        self.assertEqual(self.config("kmwan")["global"]["enable"], "1")
+        self.assertEqual(self.config("kmwan")["usb"]["metric"], "1")
+        self.assertEqual(self.config("kmwan")["wired"]["metric"], "2")
+        peers = [v for v in self.config("network").values() if v["_type"] == "wireguard_wg0"]
+        self.assertEqual(len(peers), 1)
+        self.assertEqual(peers[0]["route_allowed_ips"], "0")
+        self.setup_router()
+        for name, data in self.originals.items():
+            self.assertEqual((self.root / "etc/cellbridge-backup" / name).read_bytes(), data)
+        self.run_script("cellbridge-revert.sh")
+        for name, data in self.originals.items():
+            self.assertEqual((self.root / "etc/config" / name).read_bytes(), data)
+        self.assertFalse((self.root / "service-enabled").exists())
+        self.assertFalse((self.root / "etc/init.d/cellbridge-failover").exists())
+        self.assertFalse((self.root / "usr/sbin/cellbridge-failover").exists())
+        self.assertFalse((self.root / "etc/cellbridge-backup").exists())
+        before = {n: (self.root / "etc/config" / n).read_bytes() for n in self.originals}
+        self.run_script("cellbridge-revert.sh")
+        self.assertEqual({n: (self.root / "etc/config" / n).read_bytes() for n in before}, before)
+
+    def test_missing_companion_aborts_before_router_configuration_changes(self):
+        (self.root / "input/cellbridge-failover.sh").unlink(missing_ok=True)
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY, success=False)
+        self.assertFalse((self.root / "etc/cellbridge-backup").exists())
+        for name, data in self.originals.items():
+            self.assertEqual((self.root / "etc/config" / name).read_bytes(), data)
+
+    def test_foreign_routing_table_aborts_before_configuration_changes(self):
+        self.env["ROUTE_CONFLICT"] = "1"
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY, success=False)
+        for name, data in self.originals.items():
+            self.assertEqual((self.root / "etc/config" / name).read_bytes(), data)
+
+    def test_lost_completed_backup_cannot_be_replaced_with_modified_configuration(self):
+        self.setup_router()
+        backup = self.root / "etc/cellbridge-backup"
+        (backup / "network").unlink()
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY, success=False)
+        self.assertFalse((backup / "network").exists())
+        self.assertTrue((backup / "snapshot-complete").exists())
+
+    def test_missing_kmwan_backup_refuses_guessed_restore(self):
+        self.setup_router()
+        backup = self.root / "etc/cellbridge-backup"
+        (backup / "kmwan").unlink()
+        before = (self.root / "etc/config/network").read_bytes()
+        self.run_script("cellbridge-revert.sh", success=False)
+        self.assertEqual((self.root / "etc/config/network").read_bytes(), before)
+        self.assertTrue((backup / "snapshot-complete").exists())
+        self.assertTrue((self.root / "etc/init.d/cellbridge-failover").exists())
+
+    def test_failed_service_restore_keeps_backups_for_retry(self):
+        self.setup_router()
+        self.env["FAIL_KMWAN_RESTART"] = "1"
+        self.run_script("cellbridge-revert.sh", success=False)
+        self.assertTrue((self.root / "etc/cellbridge-backup/network").exists())
+        self.env.pop("FAIL_KMWAN_RESTART")
+        self.run_script("cellbridge-revert.sh")
+        self.assertFalse((self.root / "etc/cellbridge-backup").exists())
+
+    def test_existing_managed_files_and_service_enabled_state_are_restored(self):
+        worker = self.root / "usr/sbin/cellbridge-failover"
+        init = self.root / "etc/init.d/cellbridge-failover"
+        worker_data = b"#!/bin/sh\n# CellBridge-managed previous version\nexit 0\n"
+        init_data = f"#!{self.root}/etc/rc.common\n# CellBridge-managed previous service\n".encode()
+        worker.write_bytes(worker_data)
+        init.write_bytes(init_data)
+        worker.chmod(0o700)
+        init.chmod(0o700)
+        (self.root / "service-enabled").touch()
+        self.setup_router()
+        self.run_script("cellbridge-revert.sh")
+        self.assertEqual(worker.read_bytes(), worker_data)
+        self.assertEqual(init.read_bytes(), init_data)
+        self.assertTrue((self.root / "service-enabled").exists())
+        self.assertFalse((self.root / "service-running").exists())
+        self.run_script("cellbridge-revert.sh")
+        self.assertEqual(worker.read_bytes(), worker_data)
+        self.assertEqual(init.read_bytes(), init_data)
+
+    def test_failed_copy_cannot_leave_a_reusable_partial_snapshot(self):
+        self.env["FAIL_BACKUP_COPY"] = "1"
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY, success=False)
+        backup = self.root / "etc/cellbridge-backup"
+        self.assertFalse((backup / "network").exists())
+        self.assertFalse((backup / "snapshot-complete").exists())
+        for name, data in self.originals.items():
+            self.assertEqual((self.root / "etc/config" / name).read_bytes(), data)
+        self.env.pop("FAIL_BACKUP_COPY")
+        # Incomplete new-format snapshots must be repaired explicitly, never
+        # filled from potentially modified live files on a later invocation.
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY, success=False)
+
+    def test_incomplete_snapshot_does_not_authorize_removal_of_original_files(self):
+        backup = self.root / "etc/cellbridge-backup"
+        backup.mkdir()
+        for name in ("network", "firewall", "dhcp"):
+            (backup / name).write_bytes(self.originals[name])
+        worker = self.root / "usr/sbin/cellbridge-failover"
+        original = b"#!/bin/sh\n# CellBridge-managed original\nexit 0\n"
+        worker.write_bytes(original)
+        worker.chmod(0o700)
+        self.run_script("cellbridge-revert.sh", success=False)
+        self.assertEqual(worker.read_bytes(), original)
+        self.assertTrue(backup.exists())
+
+    def test_missing_snapshot_metadata_cannot_recapture_installed_monitor(self):
+        self.setup_router()
+        backup = self.root / "etc/cellbridge-backup"
+        (backup / "managed-files-snapshot").unlink()
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY, success=False)
+        self.assertFalse((backup / "managed-files-snapshot").exists())
+
+    def test_missing_installed_worker_does_not_block_revert(self):
+        self.setup_router()
+        (self.root / "usr/sbin/cellbridge-failover").unlink()
+        self.run_script("cellbridge-revert.sh")
+        self.assertFalse((self.root / "etc/init.d/cellbridge-failover").exists())
+        for name, data in self.originals.items():
+            self.assertEqual((self.root / "etc/config" / name).read_bytes(), data)
+
+    def test_firewall_restore_failure_keeps_snapshot(self):
+        self.setup_router()
+        self.env["FAIL_FIREWALL_RELOAD"] = "1"
+        self.run_script("cellbridge-revert.sh", success=False)
+        self.assertTrue((self.root / "etc/cellbridge-backup/network").exists())
+
+    def test_existing_monitor_does_not_authorize_foreign_table_cleanup(self):
+        worker = self.root / "usr/sbin/cellbridge-failover"
+        worker.write_text("#!/bin/sh\n# CellBridge-managed original\nexit 0\n")
+        worker.chmod(0o700)
+        self.env["ROUTE_CONFLICT"] = "1"
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY, success=False)
+        for name, data in self.originals.items():
+            self.assertEqual((self.root / "etc/config" / name).read_bytes(), data)
+
+    def test_failed_routing_inspection_does_not_allow_installation(self):
+        self.env["ROUTE_INSPECTION_FAILURE"] = "1"
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY, success=False)
+        for name, data in self.originals.items():
+            self.assertEqual((self.root / "etc/config" / name).read_bytes(), data)
+
+    def test_disabled_but_running_original_service_is_restarted_without_enabling(self):
+        worker = self.root / "usr/sbin/cellbridge-failover"
+        init = self.root / "etc/init.d/cellbridge-failover"
+        worker.write_text("#!/bin/sh\n# CellBridge-managed original\nexit 0\n")
+        init.write_text(f"#!{self.root}/etc/rc.common\n# CellBridge-managed original\n")
+        worker.chmod(0o700)
+        init.chmod(0o700)
+        (self.root / "service-running").touch()
+        self.setup_router()
+        self.run_script("cellbridge-revert.sh")
+        self.assertFalse((self.root / "service-enabled").exists())
+        self.assertTrue((self.root / "service-running").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

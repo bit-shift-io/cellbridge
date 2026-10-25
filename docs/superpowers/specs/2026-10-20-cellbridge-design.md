@@ -4,6 +4,11 @@
 **Status:** Draft for approval
 **Topic:** Rootless Android internet-sharing bridge over WireGuard
 
+**Router failover update:** The later approved behaviour in
+[`2026-10-25-router-failover-design.md`](2026-10-25-router-failover-design.md)
+supersedes D9, the automatic-failover non-goal and the WAN-disable procedure below.
+Prefer healthy CellBridge, then USB tether, then WAN.
+
 ---
 
 ## 1. Intent and why

@@ -1,312 +1,212 @@
-# CellBridge router scripts
+# CellBridge router setup and recovery
 
-Two POSIX `sh` scripts for the GL.iNet Flint 3 (GL-BE9300, OpenWrt with
-**fw4/nftables**) that make the router send the LAN's internet traffic through
-a WireGuard tunnel to the phone.
+For GL.iNet Flint 3 / OpenWrt with **fw4/nftables and enabled GL.iNet kmwan**.
+The scripts configure a WireGuard tunnel to the phone and add internet-health
+failover. **They add to kmwan; they do not replace or disable it.**
 
-> **Warning: this changes the router's networking and removes its normal
-> internet uplink.** The LAN becomes **fail-closed**: when the phone is not
-> connected, the LAN has no internet. Open an SSH session **over the LAN**
-> (`ssh root@192.168.8.1`) before you start, and keep it open until you have
-> verified the tunnel. `cellbridge-revert.sh` is the only way back.
+## Priority
 
-## Topology
+1. CellBridge, once internet through the tunnel is verified.
+2. USB tethering, when attached and working.
+3. The existing WAN, including the old hotspot → second router → WAN arrangement.
 
-```
-[LAN client] --+--> [Flint 3: default route via wg0, masquerade]
-               |            |
-               |            v  WireGuard over Wi-Fi (phone initiates)
-               |   [Phone: boringtun -> userspace gateway -> cellular sockets]
-               |            |
-               |            v
-               |        [Internet]
-               |
-        SSH stays here (br-lan, 192.168.8.1)
-```
+Other existing kmwan members remain configured. USB and WAN get IPv4 metrics
+1 and 2 respectively; kmwan is put in failover mode, not load-balancing mode.
+Its existing probe timing is retained. No extra USB polling loop is installed;
+kmwan monitors USB when it has an attached network device.
 
-* The router is the WireGuard **server**: `wg0`, `10.10.10.1/24`, UDP `51820`.
-* The phone is the only **peer** (`10.10.10.2/24`) and the **initiator**. It is
-  a normal Wi-Fi client of the router, so no static DHCP lease or fixed phone
-  LAN address is required.
-* The router installs `default dev wg0` and masquerades forwarded traffic, so
-  the phone sees every LAN client as `10.10.10.1`.
-* There is **no backup uplink**. The old WAN is disabled.
+If nothing works there is no internet. Existing connections may reset when paths
+change. This supersedes the original fail-closed/no-backup design.
 
-Why the tunnel does not route itself: `allowed_ips 0.0.0.0/0` installs a
-default route via `wg0`, but the LAN's connected route
-`192.168.8.0/24 dev br-lan` is more specific. The phone's own LAN address (the
-WireGuard endpoint) therefore stays reachable through `br-lan`, and the
-encapsulated UDP does not recurse into the tunnel. Do not "fix" this by
-routing the phone's LAN address into `wg0`.
+## Before running setup
 
-## Prerequisites
+- Keep the router's current internet source running: setup may download tools.
+  The phone can remain a hotspot until setup finishes; join it to the router's
+  Wi-Fi afterwards, keeping mobile data enabled.
+- Keep an SSH session open **over the LAN**, preferably from a wired computer.
+  Network/firewall reloads may briefly interrupt traffic.
+- In CellBridge Configuration, copy **Phone public key**. The app generates its
+  private key and shows its public key; the private key stays on the phone.
+- Record a baseline from a LAN client: `curl -4 https://ifconfig.me`.
+- Substitute your router's LAN address below; do not assume its default address.
 
-* SSH access to the router over the LAN (`ssh root@192.168.8.1`).
-* The phone connected to the router's Wi-Fi as a normal client, with the
-  CellBridge app installed.
-* The **phone's WireGuard public key**.
-* A baseline reading of the LAN's current public IP (see Verification).
-
-### Where the phone's public key comes from
-
-The setup script takes only the phone's **public** key. The phone's **private**
-key must never be sent to the router.
-
-The public key is the one belonging to the private key the app uses. At the
-time of writing the app has a "Private key" field and a "Peer public key"
-field, but **no key generator and no display of the phone's own public key**.
-That is an app-side gap. Until it is added, do one of:
-
-1. Generate the pair on a trusted machine and keep the private key on the
-   phone:
-
-   ```sh
-   wg genkey > phone-private.key
-   wg pubkey < phone-private.key > phone-public.key
-   ```
-
-   Paste the contents of `phone-private.key` into the app's **Private key**
-   field (the Android store encrypts it), and use `phone-public.key` with this
-   script. Delete the files from the trusted machine afterwards.
-
-2. Or derive the public key from the private key already configured in the
-   app, on the phone or on a trusted machine:
-
-   ```sh
-   printf '%s\n' '<the app private key>' | wg pubkey
-   ```
-
-The app should eventually show and copy its own public key; that is the
-cleanest workflow and does not require the private key to be handled anywhere
-else.
-
-## Install the scripts
+## Copy all three scripts
 
 From the repository root:
 
 ```sh
-scp router/cellbridge-setup.sh router/cellbridge-revert.sh root@192.168.8.1:/root/
+scp router/cellbridge-setup.sh router/cellbridge-revert.sh \
+    router/cellbridge-failover.sh root@ROUTER_LAN_ADDRESS:/root/
+ssh root@ROUTER_LAN_ADDRESS
 ```
 
-## Run setup
-
-**Keep the SSH session open.** The script does not touch the LAN interface or
-the LAN firewall input policy, so SSH stays up throughout, but the WAN is
-deliberately disabled at the end.
+The monitor must be beside setup. Setup checks this before making configuration
+changes. Run on the router:
 
 ```sh
-ssh root@192.168.8.1 \
-  'sh /root/cellbridge-setup.sh --phone-public-key "<phone-public-key>"'
+sh /root/cellbridge-setup.sh --phone-public-key 'PHONE_PUBLIC_KEY'
 ```
 
-The public key is 44 base64 characters ending in `=`. The script validates it
-and refuses anything else.
+Setup installs any missing WireGuard support, `curl`, `ca-bundle`, `ip-full` and
+optional `qrencode` before changing routing. Missing mandatory dependencies abort
+setup. Setup does **not** disable the WAN. `--keep-wan` is still accepted for
+compatibility, but keeping backup uplinks is now the default behaviour.
 
-Useful options:
+Options:
 
 | Option | Effect |
-| :--- | :--- |
-| `--phone-public-key KEY` | phone's public key (required) |
-| `--dns ADDR` | upstream resolver(s), repeatable; default `1.1.1.1` |
-| `--wan-iface NAME` | extra UCI interface to disable; auto-detection normally finds `wan`/`wan6` |
-| `--keep-wan` | configure the tunnel but **do not** disable the WAN |
-| `--help` | usage |
+|---|---|
+| `--phone-public-key KEY` | Required phone WireGuard public key |
+| `--dns ADDR` | Repeatable public DNS upstream; default `1.1.1.1` |
+| `--wan-iface NAME` | Extra backup UCI interface for snapshot/recovery bookkeeping |
+| `--keep-wan` | Compatibility option; backups always stay enabled |
+| `--help` | Print usage |
 
-`--keep-wan` is a configuration rehearsal, not a fallback:
-`allowed_ips 0.0.0.0/0` still installs a default route via `wg0`, so the old
-WAN is no longer guaranteed to be the preferred path. Connect the phone, confirm
-`wg show wg0` reports a handshake and that LAN traffic really exits through the
-phone, then re-run **without** `--keep-wan` to fail closed. A `--keep-wan` run
-does not undo a WAN that an earlier run disabled.
+After setup completes, turn off the old phone hotspot if necessary and join the
+phone to this router's Wi-Fi as a **client**. Scan the terminal QR using
+CellBridge Configuration, save the settings, then connect. No internet is needed
+to scan/save. The router keeps using backup routing until tunnel internet passes
+two consecutive health rounds.
 
-The script is idempotent. It reuses the existing `wg0` private key and the
-existing snapshot, reconciles the peer to exactly one entry, and can be re-run
-on a partially configured router.
+The QR includes the router public key, generated/reused preshared key, LAN
+endpoint, address and MTU. Treat terminal screenshots as sensitive. If QR rendering
+is unavailable, use the printed settings. Re-running setup retains keys and the
+first backup. Older peers without a preshared key must scan the new settings.
 
-### What setup changes
+## How failover works
+
+`/etc/init.d/cellbridge-failover` supervises `/usr/sbin/cellbridge-failover` with
+procd and starts it after boot. kmwan continues handling physical-uplink health.
+
+- Every round checks HTTPS through `wg0`, with a three-second request timeout.
+- It tries `https://1.1.1.1/cdn-cgi/trace`, then `https://1.0.0.1/cdn-cgi/trace`
+  if the first fails. One HTTP 200 with a valid TLS certificate is sufficient.
+- Two consecutive good rounds prefer CellBridge; three failed rounds withdraw it.
+- Rounds are separated by two seconds; worst-case detection is roughly 24 seconds
+  plus scheduling delays. Recovery is usually quicker.
+- Checks are numeric-IP, proxy-disabled, IPv4 and interface-bound, so WAN DNS,
+  proxies or a captive-portal redirect cannot masquerade as tunnel health.
+- Checks continue through the tunnel while the LAN uses a backup, enabling
+  automatic return to CellBridge. A dedicated probe routing table prevents them
+  from falling through to USB/WAN if the tunnel is unavailable.
+- A stop/restart removes the monitor's preferred route. Restart begins on backup
+  routing until the tunnel has been rechecked.
+
+The tunnel retains `allowed_ips=0.0.0.0/0` but uses `route_allowed_ips=0`.
+The monitor owns tables **51820** (healthy tunnel default) and **51821** (isolated
+probes). An exact tunnel-source rule at priority 0 follows the kernel local rule
+and precedes vendor local-output routing. Rules 100/101 preserve connected
+main-table routes before consulting the preferred tunnel table. This keeps LAN
+access and the phone's outer WireGuard endpoint on the LAN. Routes/rules carry
+protocol tag 186. Setup and cleanup validate the reserved entries on every run,
+including upgrades, and refuse foreign entries or failed routing inspection.
+Cleanup filters by the ownership tag as well.
+
+The fallback path itself remains subject to kmwan's existing health checks.
+There is no second custom WAN/USB monitor: the tunnel is withdrawn when unhealthy
+whether or not a backup works.
+
+## Changes and backups
+
+Setup creates an owner-only `/etc/cellbridge-backup/` **before configuration
+changes**. It saves:
+
+- `/etc/config/network`, `/etc/config/firewall`, `/etc/config/dhcp`;
+- `/etc/config/kmwan`, including original mode, priorities and member settings;
+- any previous CellBridge monitor/init files, boot-enabled state and running state;
+- presence markers for files originally absent and recovery bookkeeping.
+
+Copies and metadata are published atomically under a versioned snapshot format,
+so an interrupted copy cannot become a reusable partial backup. A completed backup
+is never repaired using subsequently modified configuration. Missing required
+files/metadata or an incomplete snapshot cause setup/revert to stop and preserve
+the snapshot for explicit repair. Do not delete an incomplete snapshot unless you
+have established that its originals are safely recoverable.
 
 | Area | Change |
-| :--- | :--- |
-| `/etc/config/network` | creates/reconciles `network.wg0`: `proto=wireguard`, `addresses=10.10.10.1/24`, `listen_port=51820`, `mtu=1420`, `nohostroute=1`; generates the router private key if absent |
-| Peer | exactly one `wireguard_wg0` peer: `public_key=<phone>`, `preshared_key=<generated once and reused>`, `allowed_ips=0.0.0.0/0`, `route_allowed_ips=1` (installs the default route) |
-| `/etc/config/firewall` | zone `vpn` over `wg0` with `input=ACCEPT`, `output=ACCEPT`, `forward=REJECT`, `masq=1`, `mtu_fix=1`; forwarding `lan -> vpn` |
-| `/etc/config/dhcp` | dnsmasq `noresolv=1` and `server=<--dns>` (default `1.1.1.1`), so DNS goes through the tunnel instead of a dead WAN resolver |
-| WAN | `disabled=1` on the detected WAN interface(s), normally `wan` and `wan6` |
+|---|---|
+| Network | `wg0`, `10.10.10.1/24`, UDP 51820, MTU 1420; one phone peer |
+| Routing | Health-controlled policy tables instead of an unconditional tunnel default |
+| Firewall | `vpn` zone for `wg0`, masquerade, MSS clamping, `lan → vpn` forwarding |
+| DNS | Public resolvers via whichever IPv4 path is selected |
+| kmwan | Keep enabled; failover mode; USB metric 1, WAN metric 2 |
+| Service | Install/enable the CellBridge procd monitor |
 
-Before any change, setup copies `/etc/config/network`, `/etc/config/firewall`
-and `/etc/config/dhcp` into `/etc/cellbridge-backup/`, records the detected WAN
-interfaces and the original dnsmasq upstream, and creates a
-`snapshot-complete` marker. It never overwrites an existing snapshot.
+Upgrading an older fail-closed setup re-enables only backup interfaces that were
+enabled in the original network snapshot. Originally user-disabled interfaces are
+preserved. Dependencies installed by setup are left installed by revert.
 
-Before the WAN is disabled, the script checks that WireGuard works by creating
-and deleting a throwaway kernel interface. If `wg` or kernel support is
-missing it tries `wireguard-tools` / `kmod-wireguard` via `opkg` while the WAN
-is still up; if that fails it stops with the WAN left enabled.
-
-At the end it prints:
-
-* the router's `wg0` public key,
-* the endpoint `192.168.8.1:51820` (the detected LAN address),
-* the tunnel addresses (`10.10.10.1/24` and `10.10.10.2/24`),
-* the peer preshared key (generated on the first run and reused on re-runs),
-* the phone's WireGuard settings to enter in the app,
-* a terminal QR code the app can scan to fill those settings.
-
-The phone's private key is never accepted, printed or stored by the script.
-The preshared key is generated on the router and is included in the phone
-settings and the QR, so the app does not need to generate one. Treat
-screenshots of this terminal as sensitive.
-
-Upgrade note: older setup versions created the peer without a preshared key.
-The first run after upgrading generates one and adds it to the peer, so any
-phone configured by the old script must be updated with the new `PresharedKey`
-(scan the new QR or enter it) or its handshake will fail. Later runs reuse the
-same key.
-
-The QR is rendered with `qrencode`, which setup installs automatically while
-the WAN is still up. If the package is unavailable or rendering fails, setup
-prints the text settings plus the raw `CELLBRIDGE1:` payload instead and keeps
-going.
-
-## Run revert
-
-```sh
-ssh root@192.168.8.1 'sh /root/cellbridge-revert.sh'
-```
-
-It prints what it restored and the current WAN state.
-
-* If `/etc/cellbridge-backup/` contains all three config files, revert copies
-  them back (and verifies them byte-for-byte), reloads network/firewall/dnsmasq,
-  removes the state directory, and re-enables the WAN. The previous
-  `wg0`/DNS/WAN state is restored exactly.
-* If no usable snapshot exists, it removes what setup added (`wg0` and its
-  peers, the `vpn` zone, the `lan -> vpn` forwarding, the public resolver
-  override) and re-enables the detected WAN interface(s).
-* If nothing from CellBridge is found, it says so and changes nothing.
-
-Revert is idempotent: running it twice is safe, and it is safe on a router where
-setup never ran. It keeps a broken/incomplete snapshot and says so rather than
-pretending the restore succeeded.
-
-## Verify
-
-Run these from a **LAN client** unless stated otherwise.
-
-### 1. Before setup
-
-```sh
-curl -s ifconfig.me
-ping -c 3 1.1.1.1
-```
-
-Record the public IP as `BEFORE_IP`. This is the old WAN's address.
-
-### 2. On the router, after setup
-
-```sh
-wg show wg0
-```
-
-Expected: the phone peer, `allowed ips: 0.0.0.0/0`, and
-`listening port: 51820`. `latest handshake` only appears after the phone app
-connects; the `endpoint` will be the phone's LAN address (it can change when the
-phone reconnects, which is fine).
-
-```sh
-ip -4 addr show wg0        # inet 10.10.10.1/24
-ip route                   # default dev wg0; 192.168.8.0/24 dev br-lan
-```
-
-The `br-lan` route must still be present. That is what keeps the phone's
-endpoint reachable and the tunnel from recursing.
-
-### 3. From the LAN client, with the phone connected
-
-```sh
-curl -s ifconfig.me
-```
-
-Expected: this now returns the **phone's cellular public IP**, not
-`BEFORE_IP`. Confirm the phone's cellular IP independently (for example in a
-terminal app on the phone with Wi-Fi temporarily off, or from the carrier's
-account page). A `BEFORE_IP` result means the default route did not move into
-the tunnel.
-
-```sh
-ping -c 3 1.1.1.1
-nslookup example.com
-```
-
-DNS must resolve: the router's dnsmasq forwards to `1.1.1.1` over the tunnel.
-
-If `curl` works but `nslookup` does not, check `logread | grep dnsmasq` and the
-dnsmasq upstream from `uci show dhcp | grep -E 'server|noresolv'`.
-
-### 4. Handshake and traffic
+## Verify after installation
 
 On the router:
 
 ```sh
-wg show wg0 latest-handshakes
-wg show wg0 transfer
+wg show wg0
+/usr/sbin/cellbridge-failover status
+ip -4 rule show
+ip -4 route show table 51820
+ip -4 route show table 51821
+cat /proc/gl-kmwan/config
+logread -e cellbridge-failover
 ```
 
-A fresh `latest handshake` (seconds, not hours) and growing transfer counters
-mean the phone is carrying the LAN's traffic. `No handshake` means the phone is
-not connected, the keys do not match, or UDP 51820 is blocked between the
-phone and the router.
+Expected with working CellBridge: a recent WireGuard handshake, `path=tunnel`,
+and a default via `wg0` in table 51820. Table 51821 contains the tunnel probe
+default and an unreachable guard. Main-table physical-uplink routes stay present.
 
-## Recovery
-
-**The LAN is fail-closed by design.** If the phone is away, asleep, rebooted
-without the app, or off the Wi-Fi, there is no internet until it returns. This
-is intentional (D9): there is no fallback route.
-
-SSH over the LAN (`192.168.8.1`) keeps working in this state. To restore the
-old WAN:
+From a LAN client, verify browsing and DNS:
 
 ```sh
-ssh root@192.168.8.1 'sh /root/cellbridge-revert.sh'
+curl -4 https://ifconfig.me
+nslookup example.com
 ```
 
-If you cannot SSH:
+The public IP alone is not proof of the selected path: the old hotspot and
+CellBridge may share the same cellular exit. Use monitor status, routes and
+WireGuard transfer counters too. ICMP forwarding through CellBridge is best-effort;
+do not make ping success a requirement for a working tunnel.
 
-1. Connect a computer to a LAN port of the router.
-2. Give it a static address in `192.168.8.0/24` (for example
-   `192.168.8.2/24`); a gateway is not needed to reach `192.168.8.1`.
-3. `ssh root@192.168.8.1`, then run the revert script.
+Test fallback by stopping CellBridge in the app, making the old hotspot/WAN or USB
+upstream available, and waiting for `path=backup`. Verify LAN internet. Then restore
+CellBridge, check `path=tunnel` returns, and verify internet again. With both USB and
+WAN working, verify native kmwan selects USB. Check phone LAN/NAS access as well.
 
-Do not expect a reboot to recover the WAN: the configuration persists. Do not
-delete `/etc/cellbridge-backup/` while CellBridge is configured; it is the only
-exact record of the previous state.
+## Revert
 
-## Assumptions and limits
+Over LAN SSH:
 
-* Written for **fw4/nftables** (`masq`, `mtu_fix`, zones, forwardings). If the
-  firmware only has fw3, the UCI options are the same and the script falls back
-  to `/etc/init.d/firewall reload`, but this combination was not tested.
-* WAN detection looks for interface names matching `wan*`, `wwan*`,
-  `usbwan*` and `*_wan`, and prints what it found. On unusual firmware, name
-  the interface explicitly with `--wan-iface`.
-* WireGuard availability is tested by creating a kernel interface, so both
-  `kmod-wireguard` and a built-in kernel implementation work. Package install
-  uses `opkg` (the package manager on GL.iNet's current firmware); if the
-  firmware uses `apk`, install `wireguard-tools` manually **before** running
-  setup.
-* A stock GL.iNet firmware has no firewall zone named `vpn`. If one already
-  exists, setup reuses it and turns on masquerade/MSS clamping; revert without
-  a snapshot cannot restore those option values.
-* The phone's handshake arrives on `br-lan`, so the **LAN** zone's input policy
-  governs UDP 51820. Stock firmware accepts input on `lan`. Setup reads the
-  policy and warns if it is not `ACCEPT`; it never changes the LAN zone,
-  because that is the operator's SSH path.
-* IPv6 is out of scope. `wan6` is disabled, and IPv6-only destinations will
-  fail.
-* QR output needs `qrencode`. Setup installs it via `opkg` before the WAN is
-  disabled, but if the feed is unreachable the script prints the text settings
-  and raw payload instead. A re-run after the WAN is already disabled cannot
-  install it.
-* The script does not configure the phone's app directly; it prints the values
-  and a QR code that the app scans. The phone must be a Wi-Fi client of this
-  router, not a hotspot.
+```sh
+sh /root/cellbridge-revert.sh
+```
+
+Revert stops/disables the monitor and removes its exact rules/tables before
+restoring configuration files byte-for-byte, restarting services and restoring
+any previous managed monitor/service state. Enabled/stopped and disabled/running
+are restored independently. It deletes the backup only after required service
+reloads succeed. Failure keeps it for retry. A small restore receipt prevents a
+second revert from deleting a restored older monitor; re-running revert is harmless.
+
+With no snapshot, targeted cleanup removes CellBridge artifacts and re-enables
+detected WANs; it cannot reconstruct lost original kmwan/DNS settings. An incomplete
+or damaged snapshot is retained and is **not** treated as permission to guess.
+Do not delete `/etc/cellbridge-backup/` while CellBridge is installed.
+
+## Limits and local checks
+
+- IPv4 only. Existing IPv6 uplinks are unchanged and may use WAN independently.
+- A phone must use cellular as the upstream when USB tethering; sharing the
+  router's own Wi-Fi connection back into it does not provide another internet path.
+- VPN policy changes or other routing managers added later may interact with the
+  reserved policy tables/rules and require rechecking.
+- The router's multi-WAN UI should retain USB before WAN if priorities are edited.
+- Local tests cover UCI/procd command boundaries and real Linux policy routing in
+  disposable, rootless network namespaces. Actual hardware failover, boot and
+  recovery must still be verified by the person running setup. Namespace tests
+  skip on hosts that prohibit unprivileged user/network namespaces.
+
+```sh
+python -m unittest discover -s router/tests -v
+sh -n router/cellbridge-setup.sh
+sh -n router/cellbridge-revert.sh
+sh -n router/cellbridge-failover.sh
+```

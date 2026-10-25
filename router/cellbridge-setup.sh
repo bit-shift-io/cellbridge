@@ -17,17 +17,14 @@
 # needed.  The router sends the LAN's default traffic into the tunnel and
 # masquerades it, so the phone sees every LAN client as 10.10.10.1.
 #
-# This script is fail-closed by design: the old WAN is disabled and there is
-# no backup uplink.  If the phone is away the LAN has no internet until the
-# phone returns or cellbridge-revert.sh is run.  SSH on the LAN stays up.
+# Prefer verified tunnel internet, then USB tethering, then WAN. kmwan keeps
+# managing physical uplinks; the companion health monitor adds tunnel routing.
+# All missing dependencies are installed before changing routing.
 #
 # Route note -- do not "fix" this:
-#   `route_allowed_ips 1` with `allowed_ips 0.0.0.0/0` installs a default
-#   route (`default dev wg0`) in the main table.  The LAN's connected route
-#   `192.168.8.0/24 dev br-lan` is more specific, so the phone's own LAN
-#   address -- which is the WireGuard endpoint -- is still reached through
-#   br-lan.  The encapsulated UDP packets therefore do not recurse into the
-#   tunnel, and the tunnel comes up without a route to its own endpoint.
+#   `route_allowed_ips 0` leaves default routing to the health monitor.
+#   Connected main-table routes are consulted before its preferred tunnel
+#   table, so the phone's LAN endpoint stays reachable through br-lan.
 #   Do not replace the LAN route with a broader one and do not route the
 #   phone's LAN address into wg0.
 #
@@ -42,11 +39,9 @@
 #   --phone-public-key KEY   phone's WireGuard *public* key (required)
 #   --dns ADDR               upstream resolver for dnsmasq (repeatable,
 #                            default 1.1.1.1)
-#   --wan-iface NAME         extra UCI interface to disable (repeatable);
+#   --wan-iface NAME         extra backup UCI interface (repeatable);
 #                            normally auto-detected
-#   --keep-wan               configure the tunnel but leave the WAN enabled
-#                            (rehearsal only: the default route still moves
-#                            to wg0, so this is not a guaranteed fallback)
+#   --keep-wan               accepted for compatibility; backups now stay on
 #   -h, --help               this text
 #
 # The phone's *private* key must never be passed to this script or stored on
@@ -73,6 +68,12 @@ WG_MTU=1420
 PHONE_ADDR=10.10.10.2/24
 DEFAULT_DNS=1.1.1.1
 LAN_DEV=br-lan
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd) || exit 1
+MONITOR_SOURCE=$SCRIPT_DIR/cellbridge-failover.sh
+MONITOR=/usr/sbin/cellbridge-failover
+MONITOR_INIT=/etc/init.d/cellbridge-failover
+INSTALL_MARKER=/etc/cellbridge-installed
+RESTORED_MARKER=/etc/cellbridge-restored
 
 msg()  { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -100,8 +101,8 @@ Usage:
 Options:
   --phone-public-key KEY   phone WireGuard public key (required)
   --dns ADDR               upstream resolver (repeatable, default 1.1.1.1)
-  --wan-iface NAME         extra WAN UCI interface to disable (repeatable)
-  --keep-wan               do not disable the WAN (rehearsal; not a fallback)
+  --wan-iface NAME         extra backup UCI interface (repeatable)
+  --keep-wan               compatibility option; backups now always stay on
   -h, --help               show this help
 
 The phone's private key must never be given to this script.
@@ -110,6 +111,9 @@ It prints the phone's WireGuard settings, including the generated or reused
 preshared key, plus a QR code for the CellBridge app.  Setup installs
 `qrencode` while the WAN is up; if that fails, the text settings and the raw
 payload are printed instead.
+
+Copy cellbridge-failover.sh beside this script before running it. Requires
+GL.iNet kmwan enabled. Priority: verified CellBridge internet, USB tether, WAN.
 EOF
 }
 
@@ -120,7 +124,6 @@ EOF
 PHONE_PUB=${CELLBRIDGE_PHONE_PUBLIC_KEY:-}
 DNS_LIST=
 WAN_OVERRIDES=
-KEEP_WAN=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -152,7 +155,6 @@ while [ $# -gt 0 ]; do
 		shift
 		;;
 	--keep-wan)
-		KEEP_WAN=1
 		shift
 		;;
 	-h|--help)
@@ -204,6 +206,15 @@ command -v ip  >/dev/null 2>&1 || die "ip not found"
 
 uci -q get 'dhcp.@dnsmasq[0]' >/dev/null 2>&1 ||
 	die "no dnsmasq section in /etc/config/dhcp; refusing to guess"
+[ -f "$MONITOR_SOURCE" ] || die "copy cellbridge-failover.sh beside this setup script first"
+sh -n "$MONITOR_SOURCE" || die "the companion monitor has invalid shell syntax"
+[ -x /etc/init.d/kmwan ] && [ "$(uci -q get kmwan.global.enable)" = 1 ] ||
+	die "this failover setup requires GL.iNet kmwan enabled for physical uplinks"
+for path in "$MONITOR" "$MONITOR_INIT"; do
+	if [ -e "$path" ] && ! grep -q 'CellBridge-managed' "$path"; then
+		die "refusing to overwrite an unrelated file: $path"
+	fi
+done
 
 # Private key material must never land in a world-readable file.  The backup
 # directory contains /etc/config/network, which holds the WireGuard key.
@@ -227,7 +238,7 @@ detect_wan_sections() {
 		esac
 		lname=$(printf '%s' "$name" | tr 'A-Z' 'a-z')
 		case "$lname" in
-			wan*|wwan*|usbwan*|*_wan) printf '%s\n' "$sec" ;;
+			wan*|wwan*|usbwan*|*_wan|secondwan*|tethering*) printf '%s\n' "$sec" ;;
 		esac
 	done
 }
@@ -249,11 +260,63 @@ done
 # Snapshot
 # ---------------------------------------------------------------------------
 
-# Take the snapshot exactly once and never overwrite an earlier one.  If a
-# previous run was interrupted after copying some files, the missing files are
-# filled in; a file that is already present is from an earlier (closer to the
-# original) point in time and is kept.
+# Take the snapshot exactly once and never overwrite an earlier payload.
+# Incomplete/damaged new-format snapshots require explicit repair.
+copy_snapshot_file() {
+	[ ! -f "$2" ] || return 0
+	# Interrupted/failed copies never become reusable snapshot entries.
+	cp -p "$1" "$2.new" && cmp -s "$1" "$2.new" &&
+		chmod 600 "$2.new" && mv "$2.new" "$2"
+}
+
+snapshot_marker() {
+	printf '%s\n' "$2" > "$STATE_DIR/$1.new" &&
+		mv "$STATE_DIR/$1.new" "$STATE_DIR/$1"
+}
+
 take_snapshot() {
+	if [ -d "$STATE_DIR" ]; then
+		[ -f "$STATE_DIR/snapshot-complete" ] ||
+			die "incomplete snapshot retained; repair it before retrying setup"
+		if [ -f "$STATE_DIR/snapshot-version" ]; then
+			[ "$(cat "$STATE_DIR/snapshot-version")" = 2 ] || die "unsupported snapshot version"
+			for item in kmwan-snapshot managed-files-snapshot failover-enabled failover-running; do
+				[ -f "$STATE_DIR/$item" ] || die "completed snapshot is missing metadata: $item"
+			done
+			[ "$(cat "$STATE_DIR/snapshot-complete")" = complete ] &&
+				[ "$(cat "$STATE_DIR/managed-files-snapshot")" = complete ] || die "invalid snapshot completion metadata"
+			case "$(cat "$STATE_DIR/kmwan-snapshot")" in
+				present|absent) : ;;
+				*) die "invalid kmwan snapshot metadata" ;;
+			esac
+			for item in failover-enabled failover-running; do
+				grep -qx '[01]' "$STATE_DIR/$item" || die "invalid service snapshot state"
+			done
+		elif [ -e "$INSTALL_MARKER" ] || [ -e "$MONITOR" ] || [ -e "$MONITOR_INIT" ]; then
+			die "snapshot version is missing; refusing to recapture installed files"
+		fi
+	fi
+	# A completed snapshot is immutable. Filling a lost file from today's
+	# modified configuration would silently destroy the only rollback copy.
+	if [ -f "$STATE_DIR/snapshot-complete" ]; then
+		for cfg in network firewall dhcp; do
+			[ -f "$STATE_DIR/$cfg" ] || die "completed backup is missing $cfg; refusing to replace it"
+		done
+		if [ -f "$STATE_DIR/kmwan-snapshot" ] &&
+			[ "$(cat "$STATE_DIR/kmwan-snapshot")" = present ]; then
+			[ -f "$STATE_DIR/kmwan" ] || die "completed backup is missing kmwan"
+		fi
+		if [ -f "$STATE_DIR/managed-files-snapshot" ]; then
+			for item in failover-worker failover-init; do
+				if [ -f "$STATE_DIR/$item" ] && [ -f "$STATE_DIR/$item-absent" ]; then
+					die "conflicting backup presence metadata for $item"
+				fi
+				[ -f "$STATE_DIR/$item" ] || [ -f "$STATE_DIR/$item-absent" ] ||
+					die "completed backup is missing $item"
+			done
+			[ -f "$STATE_DIR/failover-enabled" ] || die "completed backup is missing service state"
+		fi
+	fi
 	# Only the first invocation decides whether wg0 was pre-existing; on a
 	# re-run wg0 is ours and must not be reported as foreign.
 	first_snapshot=0
@@ -261,17 +324,58 @@ take_snapshot() {
 
 	mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
 	chmod 700 "$STATE_DIR" 2>/dev/null || true
+	# Explicitly mark the new format before copying any payload. A legacy
+	# complete snapshot may be extended once, but damaged v2 metadata never is.
+	snapshot_marker snapshot-version 2 || die "cannot record snapshot version"
 
 	for cfg in network firewall dhcp; do
 		if [ -f "$STATE_DIR/$cfg" ]; then
 			msg "Reusing existing backup of /etc/config/$cfg"
 		else
-			cp -p "/etc/config/$cfg" "$STATE_DIR/$cfg" ||
+			copy_snapshot_file "/etc/config/$cfg" "$STATE_DIR/$cfg" ||
 				die "cannot back up /etc/config/$cfg"
 			chmod 600 "$STATE_DIR/$cfg" 2>/dev/null || true
 			msg "Backed up /etc/config/$cfg"
 		fi
 	done
+	# Optional configuration and managed files need presence markers as well
+	# as copies: revert must distinguish originally absent from a lost backup.
+	if [ ! -f "$STATE_DIR/kmwan-snapshot" ]; then
+		if [ -f /etc/config/kmwan ]; then
+			copy_snapshot_file /etc/config/kmwan "$STATE_DIR/kmwan" ||
+				die "cannot back up kmwan"
+			snapshot_marker kmwan-snapshot present || die "cannot record kmwan backup"
+		else
+			snapshot_marker kmwan-snapshot absent || die "cannot record absent kmwan"
+		fi
+	fi
+	if [ ! -f "$STATE_DIR/managed-files-snapshot" ]; then
+		for item in failover-worker failover-init; do
+			case "$item" in
+				failover-worker) path=$MONITOR ;;
+				failover-init) path=$MONITOR_INIT ;;
+			esac
+			if [ -e "$path" ]; then
+				copy_snapshot_file "$path" "$STATE_DIR/$item" ||
+					die "cannot back up $path"
+			elif [ ! -f "$STATE_DIR/$item" ]; then
+				snapshot_marker "$item-absent" absent || die "cannot record absent $item"
+			fi
+		done
+		if [ ! -f "$STATE_DIR/failover-enabled" ]; then
+			if [ -x "$MONITOR_INIT" ] && "$MONITOR_INIT" enabled; then
+				snapshot_marker failover-enabled 1 || die "cannot save service enabled state"
+			else
+				snapshot_marker failover-enabled 0 || die "cannot save service enabled state"
+			fi
+		fi
+		if [ -x "$MONITOR_INIT" ] && "$MONITOR_INIT" running; then
+			snapshot_marker failover-running 1 || die "cannot save service running state"
+		else
+			snapshot_marker failover-running 0 || die "cannot save service running state"
+		fi
+		snapshot_marker managed-files-snapshot complete || die "cannot complete managed file backups"
+	fi
 
 	if [ ! -f "$STATE_DIR/wan-sections" ]; then
 		if [ -n "$WAN_SECTIONS" ]; then
@@ -305,7 +409,7 @@ take_snapshot() {
 	fi
 
 	chmod 600 "$STATE_DIR"/* 2>/dev/null || true
-	: > "$STATE_DIR/snapshot-complete" ||
+	snapshot_marker snapshot-complete complete ||
 		die "cannot write $STATE_DIR/snapshot-complete"
 	chmod 600 "$STATE_DIR/snapshot-complete" 2>/dev/null || true
 }
@@ -317,12 +421,11 @@ take_snapshot
 if [ -n "$WAN_SECTIONS" ]; then
 	msg "Detected WAN interface section(s): $WAN_SECTIONS"
 else
-	warn "no WAN interface detected; nothing will be disabled"
+	warn "no backup uplink interface detected"
 fi
 
 # ---------------------------------------------------------------------------
-# WireGuard availability -- before the WAN is disabled, because afterwards
-# there is no way to install packages.
+# WireGuard availability -- install dependencies before any routing changes.
 # ---------------------------------------------------------------------------
 
 ensure_wireguard() {
@@ -373,6 +476,36 @@ if ! ensure_qrencode; then
 	warn "qrencode is unavailable; the phone settings will be printed as text"
 fi
 
+ensure_failover_tools() {
+	packages=
+	command -v curl >/dev/null 2>&1 || packages="$packages curl"
+	ip -Version 2>/dev/null | grep -q iproute2 || packages="$packages ip-full"
+	[ -s /etc/ssl/certs/ca-certificates.crt ] || packages="$packages ca-bundle"
+	if [ -n "$packages" ]; then
+		opkg update || die "cannot refresh packages; no routing changes made"
+		# Intentional splitting: packages is a list of fixed package names.
+		opkg install $packages || die "cannot install failover tools; no routing changes made"
+	fi
+	command -v curl >/dev/null 2>&1 || die "curl is unavailable"
+	ip -Version 2>/dev/null | grep -q iproute2 || die "ip-full is required for policy routing"
+	[ -s /etc/ssl/certs/ca-certificates.crt ] || die "a CA bundle is required for HTTPS health checks"
+}
+
+ensure_failover_tools
+# Check on EVERY run, including upgrades with an existing managed worker.
+sh "$MONITOR_SOURCE" check || die "cannot inspect routing or reserved tables/rules contain foreign entries"
+# Record installation provenance separately from restored original managed files.
+printf '2\n' > "$INSTALL_MARKER.new" && mv "$INSTALL_MARKER.new" "$INSTALL_MARKER" ||
+	die "cannot record installation ownership"
+rm -f "$RESTORED_MARKER" || die "cannot clear previous restore receipt"
+# Stop a previously installed monitor only after dependencies and backups exist.
+if [ -x "$MONITOR_INIT" ]; then
+	"$MONITOR_INIT" stop || die "cannot stop the previous CellBridge monitor"
+fi
+if [ -x "$MONITOR" ]; then
+	"$MONITOR" cleanup || die "cannot clean up the previous CellBridge routes"
+fi
+
 # ---------------------------------------------------------------------------
 # wg0 interface and the phone peer
 # ---------------------------------------------------------------------------
@@ -420,7 +553,7 @@ configure_network() {
 
 	# The phone's endpoint is a LAN address reached through the connected
 	# br-lan route.  No endpoint host route is needed, and disabling it keeps
-	# netifd from pinning the endpoint to the WAN we are about to disable.
+	# netifd from pinning the endpoint to a physical backup uplink.
 	uci set "network.$WG_IF.nohostroute=1"
 	uci -q delete "network.$WG_IF.disabled"
 
@@ -463,14 +596,68 @@ configure_network() {
 	uci -q batch <<EOF || die "uci: cannot set the preshared key"
 set network.$peer.preshared_key='$peer_psk'
 EOF
-	# 0.0.0.0/0 is both the default route and the inbound source filter.
+	# Keep broad cryptokey routing, but let internet health own the default.
 	uci set "network.$peer.allowed_ips=0.0.0.0/0" ||
 		die "uci: cannot set allowed_ips"
-	uci set "network.$peer.route_allowed_ips=1" ||
+	uci set "network.$peer.route_allowed_ips=0" ||
 		die "uci: cannot set route_allowed_ips"
 
 	uci commit network || die "uci commit network failed"
-	msg "Peer: $PHONE_PUB (allowed_ips 0.0.0.0/0, route_allowed_ips 1)"
+	msg "Peer: $PHONE_PUB (allowed_ips 0.0.0.0/0, health-controlled default route)"
+}
+
+configure_backup_priority() {
+	msg "Keeping kmwan enabled: USB tether first, WAN second"
+	uci set kmwan.global.mode=failover || die "cannot set kmwan failover mode"
+	for sec in $(uci -q show kmwan | awk -F'[.=]' '/=member$/ { print $2 }'); do
+		[ "$(uci -q get "kmwan.$sec.addr_type")" = 4 ] || continue
+		iface=$(uci -q get "kmwan.$sec.interface")
+		case "$iface" in
+			tethering) metric=1 ;;
+			wan) metric=2 ;;
+			*) continue ;;
+		esac
+		uci set "kmwan.$sec.metric=$metric" || die "cannot set backup member priority"
+		uci set "kmwan.$sec.disabled=0" || die "cannot enable backup member"
+		if [ -n "$(uci -q get "network.$iface")" ]; then
+			uci set "network.$iface.metric=$metric" || die "cannot set backup route priority"
+		fi
+	done
+	# Upgrading from an older fail-closed installation: only re-enable WANs
+	# that were not disabled in the ORIGINAL snapshot, not user-disabled ones.
+	for iface in $WAN_SECTIONS; do
+		if [ "$(uci -q -c "$STATE_DIR" get "network.$iface.disabled")" != 1 ]; then
+			uci -q delete "network.$iface.disabled" || true
+		fi
+	done
+	uci commit kmwan || die "cannot commit backup priorities"
+	uci commit network || die "cannot commit backup routes"
+}
+
+install_failover_monitor() {
+	cp "$MONITOR_SOURCE" "$MONITOR.new" && cmp -s "$MONITOR_SOURCE" "$MONITOR.new" &&
+		chmod 700 "$MONITOR.new" && mv "$MONITOR.new" "$MONITOR" || die "cannot install tunnel monitor"
+	cat > "$MONITOR_INIT.new" <<'EOF' || die "cannot install monitor service"
+#!/bin/sh /etc/rc.common
+# CellBridge-managed tunnel health service; kmwan retains backup management.
+START=95
+STOP=10
+USE_PROCD=1
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/sbin/cellbridge-failover run
+	procd_set_param respawn 3600 5 0
+	procd_set_param term_timeout 10
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+service_stopped() {
+	[ ! -x /usr/sbin/cellbridge-failover ] || /usr/sbin/cellbridge-failover cleanup
+}
+EOF
+	chmod 700 "$MONITOR_INIT.new" && mv "$MONITOR_INIT.new" "$MONITOR_INIT" || die "cannot protect monitor service"
+	"$MONITOR_INIT" enable || die "cannot enable monitor at boot"
 }
 
 # Print the section name of the firewall zone called "vpn", if any.
@@ -542,9 +729,7 @@ configure_firewall() {
 configure_dns() {
 	msg "Pointing dnsmasq upstream at: $DNS_LIST"
 
-	# Ignore /tmp/resolv.conf.auto: it is populated by the WAN, which is about
-	# to be disabled, and would leave dnsmasq without an upstream.  DNS then
-	# travels through the tunnel like any other UDP.
+	# Public resolvers follow the selected path, including USB/WAN fallback.
 	uci set 'dhcp.@dnsmasq[0].noresolv=1' ||
 		die "uci: cannot set noresolv"
 	uci -q delete 'dhcp.@dnsmasq[0].server'
@@ -557,11 +742,13 @@ configure_dns() {
 
 ensure_private_key
 configure_network
+configure_backup_priority
 configure_firewall
 configure_dns
+install_failover_monitor
 
 # ---------------------------------------------------------------------------
-# Apply and verify wg0 before fail-closing the WAN
+# Apply and verify wg0 before starting health-controlled tunnel preference
 # ---------------------------------------------------------------------------
 
 # Reload the network and wait until the tunnel address exists.  This is the
@@ -591,7 +778,7 @@ if ! bring_up_wg; then
 	warn "wg0 did not get $WG_ADDR within 15s"
 	warn "recent WireGuard/interface log lines:"
 	logread 2>/dev/null | grep -i -E 'wireguard|wg0|netifd' | tail -n 8 >&2 || true
-	die "refusing to disable the WAN while $WG_IF is not up; run cellbridge-revert.sh to restore"
+	die "$WG_IF did not come up; backups remain enabled; run cellbridge-revert.sh to restore"
 fi
 msg "wg0 is up with $WG_ADDR"
 
@@ -620,28 +807,11 @@ if [ -n "$lan_zone" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Fail closed: disable the old WAN uplink(s)
+# Keep the native physical-uplink controller and start tunnel health routing.
 # ---------------------------------------------------------------------------
 
-if [ "$KEEP_WAN" = 1 ]; then
-	msg "Leaving the WAN enabled (--keep-wan)"
-elif [ -z "$WAN_SECTIONS" ]; then
-	warn "no WAN interface to disable; the LAN may still have a backup uplink"
-else
-	for w in $WAN_SECTIONS; do
-		name=$(uci -q get "network.$w.name")
-		[ -n "$name" ] || name=$w
-		uci set "network.$w.disabled=1" ||
-			die "uci: cannot disable WAN interface $name"
-		msg "Disabled WAN interface: $name"
-	done
-	uci commit network || die "uci commit network failed"
-
-	/etc/init.d/network reload >/dev/null 2>&1 || true
-	for w in $WAN_SECTIONS; do
-		ifdown "$w" >/dev/null 2>&1 || true
-	done
-fi
+/etc/init.d/kmwan restart || die "kmwan restart failed; run revert to restore"
+"$MONITOR_INIT" start || die "cannot start tunnel monitor; run revert to restore"
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -670,7 +840,7 @@ msg "== CellBridge is configured =="
 msg "Router WireGuard public key: ${router_pub:-UNAVAILABLE (run: wg show $WG_IF public-key)}"
 msg "Phone endpoint:              $lan_ip:$WG_PORT (UDP)"
 msg "Tunnel addresses:            router $WG_ADDR, phone $PHONE_ADDR"
-msg "DNS upstream (via tunnel):   $(printf '%s' "$DNS_LIST" | sed 's/^ //')"
+msg "DNS upstream (selected path): $(printf '%s' "$DNS_LIST" | sed 's/^ //')"
 msg "Backup directory:            $STATE_DIR"
 msg ""
 msg "Phone WireGuard settings:"
@@ -705,22 +875,10 @@ else
 	fi
 fi
 
-if [ "$KEEP_WAN" = 1 ]; then
-	msg "WAN state: --keep-wan (this run did not change it)"
-	for w in $WAN_SECTIONS; do
-		name=$(uci -q get "network.$w.name")
-		[ -n "$name" ] || name=$w
-		msg "  $name: disabled=$(uci -q get "network.$w.disabled")"
-	done
-else
-	msg "WAN state:"
-	for w in $WAN_SECTIONS; do
-		name=$(uci -q get "network.$w.name")
-		[ -n "$name" ] || name=$w
-		msg "  $name: disabled=$(uci -q get "network.$w.disabled")"
-	done
-	[ -n "$WAN_SECTIONS" ] || msg "  (no WAN interface detected)"
-fi
+msg "Backup state (priority: USB tether, then WAN):"
+for w in $WAN_SECTIONS; do
+	msg "  $w: disabled=$(uci -q get "network.$w.disabled")"
+done
 
 msg "Default route(s) now:"
 ip route show 2>/dev/null | grep '^default' | sed 's/^/  /'
@@ -731,4 +889,7 @@ msg ""
 msg "To undo everything:"
 msg "  sh /root/cellbridge-revert.sh"
 msg ""
-msg "Remember: no backup uplink. If the phone is away, the LAN has no internet."
+msg "Tunnel internet is preferred after two good HTTPS checks; three failures select backups."
+msg "USB is monitored by kmwan only when attached; no additional USB polling is installed."
+msg "Monitor status: /usr/sbin/cellbridge-failover status"
+msg "Monitor logs: logread -e cellbridge-failover"

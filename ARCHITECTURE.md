@@ -55,5 +55,7 @@ LAN's **internet exit**, reached over a WireGuard pipe across the existing Wi-Fi
 * **No root, no `VpnService`, no `tun0`** — the phone only ever uses ordinary app sockets.
 * **The hard part is on the phone** — a userspace TCP/IP gateway, because Android will not
   NAT another device's traffic without root.
-* **Fail-closed** — there is no backup uplink; the phone being absent means no internet.
+* **Health-based fallback** — prefer CellBridge, then USB tether, then WAN; see
+  `docs/superpowers/specs/2026-10-25-router-failover-design.md`, which supersedes
+  the original fail-closed requirement.
 * **Transport, not privacy** — WireGuard is used because the router speaks it natively.

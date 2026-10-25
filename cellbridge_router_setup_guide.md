@@ -1,60 +1,53 @@
-# GL.iNet GL-BE9300 (Flint 3) Configuration for CellBridge
+# Flint 3 configuration for CellBridge
 
-In this setup the Flint 3 does **not** use a normal WAN uplink. The phone — a Wi-Fi
-**client** of the Flint 3 — is the internet exit, and the LAN's traffic is routed into a
-WireGuard tunnel to the phone.
+The router sends LAN IPv4 internet traffic through a WireGuard tunnel to the phone,
+which stays a normal Wi-Fi client with cellular data enabled. A health monitor
+prefers CellBridge only when internet actually works through it. GL.iNet kmwan
+remains enabled for USB-tether then WAN fallback.
 
-> The router side is delivered as scripts, not manual UI steps: see
-> `router/cellbridge-setup.sh` and `router/cellbridge-revert.sh`. GL.iNet's
-> WireGuard-**server** UI is built for the opposite direction (clients borrowing the
-> router's internet) and cannot express "route the LAN out through a peer".
+See **[router/README.md](router/README.md)** for the full install, backup,
+verification and revert procedure. This supersedes the old fail-closed setup.
 
-## 1. Prerequisites
+## Sequence
 
-* SSH access to the Flint 3 (`ssh root@192.168.8.1`).
-* A WireGuard key pair for the phone — the app generates and holds the private key.
-* The old WAN uplink identified, so it can be disabled.
+1. Keep the current hotspot/WAN internet working while setup installs dependencies.
+2. Copy all three scripts from `router/`: setup, revert and failover.
+3. Copy **Phone public key** from CellBridge Configuration; its private key stays
+   on the phone. Keep LAN SSH open and run setup with that public key.
+4. After setup finishes, switch the phone from hotspot to the router's Wi-Fi
+   client connection, leaving mobile data enabled.
+5. Scan the printed setup QR, save and connect in CellBridge. The router keeps
+   backup routing until tunnel internet has passed two consecutive checks.
 
-## 2. What the setup script configures
+## Phone settings
 
-| Setting | Value | Why |
-| :--- | :--- | :--- |
-| Interface | `wg0`, proto `wireguard` | the tunnel |
-| Tunnel address | `10.10.10.1/24` | the router's end of the tunnel |
-| Listen port | `51820` | the phone connects here |
-| MTU | `1420` | avoids fragmentation over Wi-Fi |
-| Peer | the phone, `allowed_ips 0.0.0.0/0`, `route_allowed_ips 1` | installs the **default route** via the tunnel |
-| Firewall zone | `vpn` for `wg0`, **masquerade ON**, **MSS clamping ON** | LAN clients appear to the phone as a single address |
-| dnsmasq | upstream set to a public resolver | DNS is carried through the tunnel like any other UDP |
-| Old WAN | **disabled** | the tunnel is the only path (fail-closed) |
+| Setting | Value |
+|---|---|
+| Private key | Generated/kept by the app |
+| Address | `10.10.10.2/24` |
+| Peer public key | Router public key printed by setup |
+| Preshared key | Generated/reused by setup; included in QR |
+| Endpoint | The router's detected LAN address, UDP port `51820` |
+| MTU | `1420` |
 
-The **phone initiates** the handshake, so the router learns the peer's endpoint by itself.
-No static lease or fixed phone IP is required.
+## Backups and recovery
 
-## 3. Reverting
+Setup snapshots network, firewall, DNS, kmwan and any previous managed monitor
+files/service state under `/etc/cellbridge-backup/`. First backups are retained
+across re-runs. Revert stops/removes new tunnel health routing, restores the
+original configuration and retains backups if restoration fails.
 
-`router/cellbridge-revert.sh` restores the previous WAN, firewall and DNS state and removes
-`wg0`. This is the **only** recovery path and it is manual — if the phone is away, the LAN
-has no internet by design.
-
-## 4. Values the phone app needs
-
-| Setting | Example | Notes |
-| :--- | :--- | :--- |
-| `PrivateKey` | *generated in the app* | never leaves the phone |
-| `Address` | `10.10.10.2/24` | the phone's tunnel IP |
-| `PublicKey` | the router's `wg0` public key | printed by the setup script |
-| `Endpoint` | `192.168.8.1:51820` | the router on the LAN |
-| `MTU` | `1420` | |
-
-## 5. Traffic flow
-
+```sh
+sh /root/cellbridge-revert.sh
 ```
-[LAN client] ──▶ [Flint 3: default route via wg0, masquerade]
-                        │
-                        ▼  WireGuard over Wi-Fi
-              [Phone: boringtun → userspace gateway → cellular sockets]
-                        │
-                        ▼
-                    [Internet]
+
+The installed monitor's status is available with:
+
+```sh
+/usr/sbin/cellbridge-failover status
+logread -e cellbridge-failover
 ```
+
+Test both fallback and automatic return to the tunnel. Existing connections may
+reset and failover can take roughly 24 seconds. If no path has internet, an outage
+is expected. IPv6 remains outside CellBridge tunnel failover.
