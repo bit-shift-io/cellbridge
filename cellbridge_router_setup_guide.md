@@ -26,6 +26,22 @@ verification and revert procedure. This supersedes the old fail-closed setup.
 
 ## Phone settings
 
+For a main and backup phone, upgrade the first install by rerunning the updated
+setup, then add the backup:
+
+```sh
+sh /root/cellbridge-setup.sh --label main
+sh /root/cellbridge-setup.sh --add-phone --label backup
+sh /root/cellbridge-setup.sh --list-phones
+```
+
+Scan each QR only on its intended phone. Existing first-phone keys and custom
+ports are preserved. `wg1` defaults to `10.10.11.2/24` on the phone and UDP 51830
+on the router. If the first phone uses 51830 already, pass an unused `--port`
+with `--add-phone`. Up to eight phones are supported. Lower priority numbers
+win (`wg0` defaults to 10, `wg1` to 20); set one with
+`--phone wg1 --priority 30`. `--phone wg1` also reprints that phone's QR.
+
 | Setting | Value |
 |---|---|
 | Private key | Generated/reused by setup, imported through QR, stored encrypted by the app |
@@ -58,3 +74,15 @@ logread -e cellbridge-failover
 Test both fallback and automatic return to the tunnel. Existing connections may
 reset and failover can take roughly 24 seconds. If no path has internet, an outage
 is expected. IPv6 remains outside CellBridge tunnel failover.
+
+With two phones, expect `selected=wg0` normally, `selected=wg1` after main-phone
+failure and fresh backup qualification, then `selected=wg0` after recovery.
+Qualification adds two successful rounds to withdrawal time. The main reclaims
+even during active backup traffic. Both apps may show Connected; check router
+status for the selected path.
+
+Idle backup Wi-Fi checks and keepalives run every 25 seconds and use no cellular
+data. They do not prove cellular internet works. The router tests cellular
+internet before promoting a backup and routinely tests the selected and
+higher-preference phones; these HTTPS requests do use cellular data. An idle
+limited-plan backup gets no routine HTTPS requests while the main is selected.

@@ -35,6 +35,8 @@ MONITOR=/usr/sbin/cellbridge-failover
 MONITOR_INIT=/etc/init.d/cellbridge-failover
 INSTALL_MARKER=/etc/cellbridge-installed
 RESTORED_MARKER=/etc/cellbridge-restored
+PHONES_FILE=/etc/cellbridge-phones.conf
+CLEANUP_RECEIPT=/etc/cellbridge-cleanup
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd) || exit 1
 
 msg()  { printf '%s\n' "$*"; }
@@ -178,7 +180,11 @@ snapshot_is_usable() {
 	[ -d "$STATE_DIR" ] || return 1
 	[ -f "$STATE_DIR/snapshot-complete" ] || return 1
 	if [ -f "$STATE_DIR/snapshot-version" ]; then
-		[ "$(cat "$STATE_DIR/snapshot-version")" = 2 ] || return 1
+		case "$(cat "$STATE_DIR/snapshot-version")" in
+		2) : ;;
+		3) [ -f "$STATE_DIR/phones-file-snapshot" ] || return 1 ;;
+		*) return 1 ;;
+		esac
 		for item in kmwan-snapshot managed-files-snapshot failover-enabled failover-running; do
 			[ -f "$STATE_DIR/$item" ] || return 1
 		done
@@ -194,6 +200,13 @@ snapshot_is_usable() {
 	for cfg in network firewall dhcp; do
 		[ -f "$STATE_DIR/$cfg" ] || return 1
 	done
+	if [ -f "$STATE_DIR/phones-file-snapshot" ]; then
+		case "$(cat "$STATE_DIR/phones-file-snapshot")" in
+		present) [ -f "$STATE_DIR/phones-config" ] || return 1 ;;
+		absent) : ;;
+		*) return 1 ;;
+		esac
+	fi
 	if [ -f "$STATE_DIR/kmwan-snapshot" ] &&
 		[ "$(cat "$STATE_DIR/kmwan-snapshot")" = present ]; then
 		[ -f "$STATE_DIR/kmwan" ] || return 1
@@ -218,7 +231,7 @@ stop_remove_failover() {
 		}
 		owned=1
 	done
-	[ "$owned" = 1 ] || return 0
+	[ "$owned" = 1 ] || [ -f "$INSTALL_MARKER" ] || [ -f "$PHONES_FILE" ] || [ -n "$OWNED_PHONES" ] || return 0
 	# Prefer the companion supplied beside revert. It also recovers a partial
 	# installation missing its installed worker, without guessing table ownership.
 	cleanup_tool=$SCRIPT_DIR/cellbridge-failover.sh
@@ -259,46 +272,27 @@ restore_managed_files() {
 	fi
 }
 
-# Is network.wg0 the interface this project creates?  Requiring the tunnel
-# address and port means a pre-existing, unrelated wg0 (for example restored
-# from a snapshot) is never mistaken for ours on a later revert run.
-is_cellbridge_wg0() {
-	[ "$(uci -q get "network.$WG_IF.proto")" = wireguard ] || return 1
-	[ "$(uci -q get "network.$WG_IF.listen_port")" = "$WG_LISTEN_PORT" ] ||
-		return 1
-	uci -q get "network.$WG_IF.addresses" | grep -q "$WG_ADDR"
+# Legacy adoption needs installation provenance as well as the tunnel shape.
+is_cellbridge_phone() {
+	[ "$(uci -q get "network.$1.cellbridge_managed")" = 1 ] && return 0
+	[ "$1" = wg0 ] && [ -f "$INSTALL_MARKER" ] || return 1
+	[ "$(uci -q get network.wg0.proto)" = wireguard ] || return 1
+	[ "$(uci -q get network.wg0.addresses)" = 10.10.10.1/24 ] || return 1
+	[ "$(uci -q show network | awk -F= '$2=="wireguard_wg0" {n++} END {print n+0}')" = 1 ] || return 1
+	[ "$(uci -q get 'network.@wireguard_wg0[0].allowed_ips')" = 0.0.0.0/0 ] &&
+		[ "$(uci -q get 'network.@wireguard_wg0[0].route_allowed_ips')" = 0 ]
 }
 
 # Are any CellBridge artifacts present?  Used to decide whether the targeted
 # (no-snapshot) cleanup has anything to do.  This is what makes a second run
 # after a successful restore a no-op instead of guessing.
 has_artifacts() {
+	[ -n "$OWNED_PHONES" ] || [ -f "$INSTALL_MARKER" ] || [ -f "$PHONES_FILE" ] || {
 	for path in "$MONITOR" "$MONITOR_INIT"; do
 		[ ! -f "$path" ] || ! grep -q 'CellBridge-managed' "$path" || return 0
 	done
-	is_cellbridge_wg0 && return 0
-
-	# A wg0 that is not ours: leave it and its firewall references alone.
-	[ -n "$(uci -q get "network.$WG_IF")" ] && return 1
-
-	# No wg0 section at all: a zone/forwarding that still names wg0 is a
-	# leftover from a previous partial cleanup.
-	for sec in $(uci -q show firewall |
-		awk -F'[.=]' '/=zone$/ { print $2 }'); do
-		[ "$(uci -q get "firewall.$sec.name")" = vpn ] || continue
-		for n in $(uci -q get "firewall.$sec.network"); do
-			[ "$n" = "$WG_IF" ] && return 0
-		done
-	done
-
-	for sec in $(uci -q show firewall |
-		awk -F'[.=]' '/=forwarding$/ { print $2 }'); do
-		[ "$(uci -q get "firewall.$sec.src")" = lan ] &&
-			[ "$(uci -q get "firewall.$sec.dest")" = vpn ] &&
-			return 0
-	done
-
 	return 1
+	}
 }
 
 # ---------------------------------------------------------------------------
@@ -306,9 +300,6 @@ has_artifacts() {
 # ---------------------------------------------------------------------------
 
 restore_snapshot() {
-	had_wg0=0
-	config_has_interface "$STATE_DIR/network" "$WG_IF" && had_wg0=1
-
 	# Discard any staged (uncommitted) uci changes first, so they cannot be
 	# replayed after the files are put back.
 	uci -q revert network >/dev/null 2>&1 || true
@@ -329,6 +320,13 @@ restore_snapshot() {
 		chmod 600 "/etc/config/$cfg" 2>/dev/null || true
 	done
 	[ "$ok" = 1 ] || return 1
+	if [ -f "$STATE_DIR/phones-file-snapshot" ] &&
+		[ "$(cat "$STATE_DIR/phones-file-snapshot")" = present ]; then
+		cp "$STATE_DIR/phones-config" "$PHONES_FILE" && chmod 600 "$PHONES_FILE" &&
+			cmp -s "$STATE_DIR/phones-config" "$PHONES_FILE" || return 1
+	else
+		rm -f "$PHONES_FILE" "$PHONES_FILE.new" || return 1
+	fi
 
 	if command -v cmp >/dev/null 2>&1; then
 		for cfg in $configs; do
@@ -345,7 +343,9 @@ restore_snapshot() {
 
 	# wg0 should disappear with the restored network config, unless it was
 	# part of the original configuration.
-	if [ "$had_wg0" = 0 ]; then
+	for WG_IF in $OWNED_PHONES; do
+		# UCI reads the original snapshot, not the now-restored runtime link.
+		[ -z "$(uci -q -c "$STATE_DIR" get "network.$WG_IF")" ] || continue
 		i=0
 		while [ "$i" -lt 10 ] &&
 			ip link show "$WG_IF" >/dev/null 2>&1; do
@@ -360,7 +360,7 @@ restore_snapshot() {
 			warn "$WG_IF still exists after the restore"
 			return 1
 		fi
-	fi
+	done
 
 	return 0
 }
@@ -371,19 +371,31 @@ restore_snapshot() {
 
 cleanup_without_snapshot() {
 	msg "No usable snapshot; removing the CellBridge configuration only"
+	# Capture proven ownership before deleting its UCI evidence. A retry uses
+	# this root-only receipt even if network deletion already committed.
+	if [ -n "$OWNED_PHONES" ]; then
+		{
+			printf '# CellBridge cleanup v1\n'
+			printf '%s\n' $OWNED_PHONES
+		} > "$CLEANUP_RECEIPT.new" && chmod 600 "$CLEANUP_RECEIPT.new" &&
+			mv "$CLEANUP_RECEIPT.new" "$CLEANUP_RECEIPT" || return 1
+	fi
 
 	uci -q revert network >/dev/null 2>&1 || true
 	uci -q revert firewall >/dev/null 2>&1 || true
 	uci -q revert dhcp >/dev/null 2>&1 || true
 
-	# network: peers first (they are sections of type wireguard_wg0), then the
-	# interface itself.
-	while uci -q delete "network.@wireguard_wg0[0]" >/dev/null 2>&1; do
-		:
-	done
-	if [ -n "$(uci -q get "network.$WG_IF")" ]; then
-		uci -q delete "network.$WG_IF"
+	for WG_IF in $OWNED_PHONES; do
+		while uci -q delete "network.@wireguard_$WG_IF[0]" >/dev/null 2>&1; do :; done
+		if [ -n "$(uci -q get "network.$WG_IF")" ]; then
+			uci -q delete "network.$WG_IF" || return 1
+		fi
 		msg "Removed network.$WG_IF"
+	done
+	# A leftover worker/file alone never authorizes unrelated UCI edits.
+	if [ -z "$OWNED_PHONES" ]; then
+		rm -f "$PHONES_FILE" "$PHONES_FILE.new" || return 1
+		return 0
 	fi
 
 	for w in $WAN_SECTIONS; do
@@ -396,49 +408,43 @@ cleanup_without_snapshot() {
 
 	uci commit network >/dev/null 2>&1 || warn "uci commit network failed"
 
-	# firewall: remove every lan -> vpn forwarding, re-scanning after each
-	# delete so anonymous-section indices cannot shift under us.
+	# Remove only owned memberships. Shared/unmarked firewall objects survive.
 	while :; do
 		found=
 		for sec in $(uci -q show firewall |
-			awk -F'[.=]' '/=forwarding$/ { print $2 }'); do
-			if [ "$(uci -q get "firewall.$sec.src")" = lan ] &&
-				[ "$(uci -q get "firewall.$sec.dest")" = vpn ]; then
-				uci -q delete "firewall.$sec"
-				msg "Removed forwarding lan -> vpn"
+			awk -F'[.=]' '/=zone$/ { print $2 }'); do
+			[ "$(uci -q get "firewall.$sec.name")" = vpn ] || continue
+			for WG_IF in $OWNED_PHONES; do
+				for member in $(uci -q get "firewall.$sec.network"); do
+					[ "$member" != "$WG_IF" ] || uci -q del_list "firewall.$sec.network=$WG_IF" || return 1
+				done
+			done
+			if [ -z "$(uci -q get "firewall.$sec.network")" ] && [ "$(uci -q get "firewall.$sec.cellbridge_managed")" = 1 ]; then
+				uci -q delete "firewall.$sec" || return 1
+				msg "Removed firewall zone 'vpn'"
 				found=1
 				break
 			fi
 		done
 		[ -n "$found" ] || break
 	done
-
-	# firewall: drop wg0 from the vpn zone; delete the zone only if wg0 is
-	# its sole network (i.e. it looks like the one setup created).
-	while :; do
-		found=
-		for sec in $(uci -q show firewall |
-			awk -F'[.=]' '/=zone$/ { print $2 }'); do
-			[ "$(uci -q get "firewall.$sec.name")" = vpn ] || continue
-			has_wg0=0
-			count=0
-			for n in $(uci -q get "firewall.$sec.network"); do
-				count=$((count + 1))
-				[ "$n" = "$WG_IF" ] && has_wg0=1
-			done
-			[ "$has_wg0" = 1 ] || continue
-			if [ "$count" -le 1 ]; then
-				uci -q delete "firewall.$sec"
-				msg "Removed firewall zone 'vpn'"
-			else
-				uci -q del_list "firewall.$sec.network=$WG_IF"
-				msg "Removed $WG_IF from the existing 'vpn' zone"
-			fi
-			found=1
-			break
-		done
-		[ -n "$found" ] || break
+	# Forwarding is shared; retain it if a vpn zone still has foreign members.
+	shared=0
+	for sec in $(uci -q show firewall | awk -F'[.=]' '/=zone$/ {print $2}'); do
+		if [ "$(uci -q get "firewall.$sec.name")" = vpn ] && [ -n "$(uci -q get "firewall.$sec.network")" ]; then shared=1; fi
 	done
+	if [ "$shared" = 0 ]; then
+		while :; do
+			found=
+			for sec in $(uci -q show firewall | awk -F'[.=]' '/=forwarding$/ {print $2}'); do
+				if [ "$(uci -q get "firewall.$sec.cellbridge_managed")" = 1 ]; then
+					uci -q delete "firewall.$sec" || return 1
+					found=1; break
+				fi
+			done
+			[ -n "$found" ] || break
+		done
+	fi
 
 	uci commit firewall >/dev/null 2>&1 || warn "uci commit firewall failed"
 
@@ -463,7 +469,8 @@ cleanup_without_snapshot() {
 
 	reload_services || return 1
 
-	# Verify that the tunnel config is gone.
+	# Verify only the interfaces whose ownership was established before edits.
+	for WG_IF in $OWNED_PHONES; do
 	if [ -n "$(uci -q get "network.$WG_IF")" ]; then
 		warn "network.$WG_IF is still configured"
 		return 1
@@ -476,6 +483,8 @@ cleanup_without_snapshot() {
 		warn "$WG_IF still exists after cleanup"
 		return 1
 	fi
+	done
+	rm -f "$PHONES_FILE" "$PHONES_FILE.new" "$INSTALL_MARKER" "$CLEANUP_RECEIPT" || return 1
 	return 0
 }
 
@@ -484,6 +493,21 @@ cleanup_without_snapshot() {
 # ---------------------------------------------------------------------------
 
 msg "== CellBridge revert =="
+
+OWNED_PHONES=
+for index in 0 1 2 3 4 5 6 7; do
+	if is_cellbridge_phone "wg$index"; then OWNED_PHONES="$OWNED_PHONES wg$index"; fi
+done
+if [ -e "$CLEANUP_RECEIPT" ]; then
+	receipt_phones=$(awk '
+		NR==1 {if($0!="# CellBridge cleanup v1") exit 1; next}
+		$0 !~ /^wg[0-7]$/ {exit 1}
+		{print $0; count++}
+		END {if(!count) exit 1}' "$CLEANUP_RECEIPT") || die "invalid cleanup receipt; repair before retrying"
+	for iface in $receipt_phones; do
+		case " $OWNED_PHONES " in *" $iface "*) : ;; *) OWNED_PHONES="$OWNED_PHONES $iface" ;; esac
+	done
+fi
 
 if [ ! -d "$STATE_DIR" ] && [ ! -e "$INSTALL_MARKER" ] && [ -f "$RESTORED_MARKER" ]; then
 	msg "This installation was already reverted; leaving the restored original state untouched."
@@ -496,7 +520,7 @@ if snapshot_is_usable; then
 		msg "Restored the previous network, firewall, DNS and kmwan configuration."
 		printf '2\n' > "$RESTORED_MARKER.new" && mv "$RESTORED_MARKER.new" "$RESTORED_MARKER" ||
 			die "cannot record successful restore; keeping backups"
-		rm -f "$INSTALL_MARKER" || die "cannot clear installation marker; keeping backups"
+		rm -f "$INSTALL_MARKER" "$CLEANUP_RECEIPT" || die "cannot clear installation marker; keeping backups"
 		if [ -d "$STATE_DIR" ]; then
 			rm -rf "$STATE_DIR" || warn "could not remove $STATE_DIR"
 		fi

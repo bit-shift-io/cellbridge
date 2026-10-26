@@ -6,6 +6,7 @@ real files and can be checked byte-for-byte.
 """
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -84,6 +85,8 @@ if cmd == "uci":
         old = data[sec].get(field, [])
         data[sec][field] = (old if isinstance(old, list) else [old]) + [value]
     elif op == "del_list":
+        if name == "firewall" and os.environ.get("FAIL_FIREWALL_MEMBERSHIP") == "1":
+            sys.exit(1)
         data[sec][field].remove(value)
     else:
         raise RuntimeError((op, args))
@@ -95,20 +98,27 @@ elif cmd == "cp":
         sys.exit(1)
     sys.exit(subprocess.run(["/usr/bin/cp", *args]).returncode)
 elif cmd == "ip":
+    needs_full = os.environ.get("IP_FULL_MISSING") == "1" and not (root / "ip-full-installed").exists()
+    if needs_full and "-N" in args:
+        print("ip: invalid option -- N", file=sys.stderr)
+        sys.exit(1)
     if args == ["-Version"]:
-        print("ip utility, iproute2-test")
+        print("BusyBox ip" if needs_full else "ip utility, iproute2-test")
     elif "rule" in args and "del" in args:
         sys.exit(2)
     elif args[:2] == ["link", "show"]:
         data = json.loads((cfgdir / "network").read_text())
-        if "wg0" not in data:
+        iface = args[-1]
+        if iface not in data:
             sys.exit(1)
-        down = (root / "wg0-down").exists()
+        down = (root / f"{iface}-down").exists()
         flags = "POINTOPOINT,NOARP" + ("" if down else ",UP,LOWER_UP")
         state = "DOWN" if down else "UNKNOWN"
-        print(f"44: wg0: <{flags}> mtu 1420 qdisc noqueue state {state} mode DEFAULT group default qlen 1000")
+        print(f"44: {iface}: <{flags}> mtu 1420 qdisc noqueue state {state} mode DEFAULT group default qlen 1000")
     elif args[:3] == ["-4", "addr", "show"]:
-        print("inet 10.10.10.1/24")
+        data = json.loads((cfgdir / "network").read_text())
+        for address in data.get(args[-1], {}).get("addresses", []):
+            print(f"inet {address}")
     elif "show" in args and "table" in args:
         if os.environ.get("ROUTE_INSPECTION_FAILURE") == "1":
             sys.exit(1)
@@ -151,6 +161,10 @@ elif cmd == "qrencode":
         sys.exit(1)
     print("[QR]")
 elif cmd == "opkg":
+    if os.environ.get("IP_FULL_MISSING") == "1":
+        if args[:1] == ["install"] and "ip-full" in args:
+            (root / "ip-full-installed").touch()
+        sys.exit(0)
     sys.exit(1)  # Tests use existing dependencies; no installation is allowed.
 elif cmd == "fw4":
     if os.environ.get("FAIL_FIREWALL_RELOAD") == "1":
@@ -641,6 +655,240 @@ esac
         self.configure_native_restart_quirk(runtime="", up="wan")
         self.run_script("cellbridge-revert.sh", success=False)
         self.assertTrue((self.root / "etc/cellbridge-backup/network").exists())
+
+    def phones(self):
+        return (self.root / "etc/cellbridge-phones.conf").read_text()
+
+    def test_add_phone_has_independent_credentials_without_touching_main(self):
+        self.run_script("cellbridge-setup.sh", "--label", "main")
+        first_qr = self.qr_payload()
+        first = self.config("network")
+        self.run_script("cellbridge-setup.sh", "--add-phone", "--label", "backup")
+        after = self.config("network")
+        for name, fields in first.items():
+            self.assertEqual(after[name], fields, name)
+        self.assertEqual(after["wg1"]["addresses"], ["10.10.11.1/24"])
+        self.assertEqual(after["wg1"]["cellbridge_managed"], "1")
+        second_qr = self.qr_payload()
+        self.assertEqual(second_qr["address"], "10.10.11.2/24")
+        self.assertEqual(second_qr["endpoint"], "192.0.2.1:51830")
+        self.assertNotEqual(first_qr["phonePrivateKey"], second_qr["phonePrivateKey"])
+        peer = next(v for v in after.values() if v["_type"] == "wireguard_wg1")
+        self.assertEqual(peer["persistent_keepalive"], "25")
+        self.assertEqual(self.phones(), "wg0 10.10.10.1 51820 51821 10 main\nwg1 10.10.11.1 51830 51831 20 backup\n")
+        self.assertEqual((self.root / "etc/cellbridge-phones.conf").stat().st_mode & 0o077, 0)
+        self.run_script("cellbridge-setup.sh", "--phone", "wg1")
+        self.assertEqual(self.qr_payload(), second_qr)
+
+    def test_priority_label_update_preserves_keys_and_other_configuration(self):
+        self.run_script("cellbridge-setup.sh")
+        before = {name: (self.root / "etc/config" / name).read_bytes() for name in self.originals}
+        self.run_script("cellbridge-setup.sh", "--priority", "7", "--label", "unlimited")
+        self.assertEqual(self.phones(), "wg0 10.10.10.1 51820 51821 7 unlimited\n")
+        for name, content in before.items():
+            self.assertEqual((self.root / "etc/config" / name).read_bytes(), content)
+        self.run_script("cellbridge-setup.sh")
+        self.assertEqual(self.phones(), "wg0 10.10.10.1 51820 51821 7 unlimited\n")
+
+    def test_list_phones_is_read_only_without_snapshot(self):
+        result = self.run_script("cellbridge-setup.sh", "--list-phones")
+        self.assertNotIn("wg0", result.stdout)
+        self.assertFalse((self.root / "etc/cellbridge-backup").exists())
+        self.assertFalse((self.root / "genkey-count").exists())
+
+    def test_add_phone_collision_stops_before_configuration_changes(self):
+        self.run_script("cellbridge-setup.sh", "--port", "51830")
+        before = (self.root / "etc/config/network").read_bytes()
+        self.run_script("cellbridge-setup.sh", "--add-phone", success=False)
+        self.assertEqual((self.root / "etc/config/network").read_bytes(), before)
+        self.run_script("cellbridge-setup.sh", "--add-phone", "--port", "51840", "--phone-public-key", KEY)
+        self.assertEqual(self.qr_payload()["endpoint"], "192.0.2.1:51840")
+        self.assertNotIn("phonePrivateKey", self.qr_payload())
+
+    def test_unmarked_existing_interface_cannot_be_adopted(self):
+        self.add_wireguard_interface("wg1", 51900)
+        before = (self.root / "etc/config/network").read_bytes()
+        self.run_script("cellbridge-setup.sh", "--phone", "wg1", success=False)
+        self.run_script("cellbridge-setup.sh", "--add-phone", success=False)
+        self.assertEqual((self.root / "etc/config/network").read_bytes(), before)
+
+    def test_manual_legacy_upgrade_preserves_existing_phone_key_without_option(self):
+        self.setup_router()
+        network = self.config("network")
+        network["wg0"].pop("cellbridge_managed", None)
+        (self.root / "etc/config/network").write_text(json.dumps(network))
+        (self.root / "etc/cellbridge-phones.conf").unlink(missing_ok=True)
+        self.run_script("cellbridge-setup.sh")
+        self.assertEqual(self.qr_payload()["phonePublicKey"], KEY)
+        self.assertNotIn("phonePrivateKey", self.qr_payload())
+        self.assertEqual(self.config("network")["wg0"]["cellbridge_managed"], "1")
+
+    def test_phone_file_mismatch_does_not_repair_by_rotating_keys(self):
+        self.run_script("cellbridge-setup.sh")
+        file = self.root / "etc/cellbridge-phones.conf"
+        file.write_text(self.phones().replace("51820", "51840"))
+        before = (self.root / "etc/config/network").read_bytes()
+        self.run_script("cellbridge-setup.sh", success=False)
+        self.assertEqual((self.root / "etc/config/network").read_bytes(), before)
+
+    def test_two_phone_revert_restores_originals_and_removes_inventory(self):
+        self.run_script("cellbridge-setup.sh")
+        self.run_script("cellbridge-setup.sh", "--add-phone")
+        self.run_script("cellbridge-revert.sh")
+        for name, content in self.originals.items():
+            self.assertEqual((self.root / "etc/config" / name).read_bytes(), content)
+        self.assertFalse((self.root / "etc/cellbridge-phones.conf").exists())
+        self.run_script("cellbridge-revert.sh")
+
+    def test_no_snapshot_cleanup_preserves_foreign_tunnel_and_shared_firewall(self):
+        self.add_wireguard_interface("wg2", 51900)
+        network = self.config("network")
+        network["wg2"]["addresses"] = ["10.10.12.1/24"]
+        (self.root / "etc/config/network").write_text(json.dumps(network))
+        firewall = self.config("firewall")
+        firewall["user_vpn"] = {"_type": "zone", "name": "vpn", "network": ["wg2"]}
+        firewall["user_fwd"] = {"_type": "forwarding", "src": "lan", "dest": "vpn"}
+        (self.root / "etc/config/firewall").write_text(json.dumps(firewall))
+        self.run_script("cellbridge-setup.sh")
+        # Add-phone intentionally refuses any stale wgN; create a second owned
+        # partial-install fixture directly to exercise recovery without adoption.
+        network = self.config("network")
+        network["wg1"] = {"_type": "interface", "proto": "wireguard", "cellbridge_managed": "1",
+                          "listen_port": "51830", "addresses": ["10.10.11.1/24"]}
+        network["phone1"] = {"_type": "wireguard_wg1", "public_key": KEY}
+        (self.root / "etc/config/network").write_text(json.dumps(network))
+        shutil.rmtree(self.root / "etc/cellbridge-backup")
+        self.run_script("cellbridge-revert.sh")
+        after = self.config("network")
+        self.assertNotIn("wg0", after)
+        self.assertNotIn("wg1", after)
+        self.assertNotIn("phone1", after)
+        self.assertEqual(after["wg2"], network["wg2"])
+        self.assertEqual(self.config("firewall")["user_vpn"]["network"], ["wg2"])
+        self.assertEqual(self.config("firewall")["user_fwd"], firewall["user_fwd"])
+        self.assertFalse((self.root / "etc/cellbridge-phones.conf").exists())
+        before = (self.root / "etc/config/network").read_bytes()
+        self.run_script("cellbridge-revert.sh")
+        self.assertEqual((self.root / "etc/config/network").read_bytes(), before)
+
+    def test_no_snapshot_custom_port_manual_legacy_cleanup_requires_provenance(self):
+        self.run_script("cellbridge-setup.sh", "--phone-public-key", KEY, "--port", "51900")
+        network = self.config("network")
+        network["wg0"].pop("cellbridge_managed")
+        (self.root / "etc/config/network").write_text(json.dumps(network))
+        shutil.rmtree(self.root / "etc/cellbridge-backup")
+        self.run_script("cellbridge-revert.sh")
+        self.assertNotIn("wg0", self.config("network"))
+
+    def test_monitor_file_does_not_authorize_deleting_unmarked_wg0(self):
+        self.add_wireguard_interface("wg0", 51820)
+        network = self.config("network")
+        network["wg0"]["addresses"] = ["10.10.10.1/24"]
+        (self.root / "etc/config/network").write_text(json.dumps(network))
+        worker = self.root / "usr/sbin/cellbridge-failover"
+        worker.write_text("#!/bin/sh\n# CellBridge-managed old worker\nexit 0\n")
+        worker.chmod(0o700)
+        self.run_script("cellbridge-revert.sh")
+        self.assertEqual(self.config("network"), network)
+
+    def test_documented_label_command_completes_legacy_migration(self):
+        self.setup_router()
+        network = self.config("network")
+        network["wg0"].pop("cellbridge_managed")
+        for fields in network.values():
+            if fields["_type"] == "wireguard_wg0":
+                fields.pop("persistent_keepalive")
+        (self.root / "etc/config/network").write_text(json.dumps(network))
+        (self.root / "etc/cellbridge-phones.conf").unlink()
+        worker = self.root / "usr/sbin/cellbridge-failover"
+        worker.write_text("#!/bin/sh\n# CellBridge-managed legacy\nexit 0\n")
+        self.run_script("cellbridge-setup.sh", "--label", "main")
+        self.assertEqual(worker.read_bytes(), (self.root / "input/cellbridge-failover.sh").read_bytes())
+        self.assertEqual(self.config("network")["wg0"]["cellbridge_managed"], "1")
+        peer = next(v for v in self.config("network").values() if v["_type"] == "wireguard_wg0")
+        self.assertEqual(peer["persistent_keepalive"], "25")
+        self.assertEqual(peer["public_key"], KEY)
+        self.assertEqual(self.phones(), "wg0 10.10.10.1 51820 51821 10 main\n")
+
+    def test_fresh_busybox_install_obtains_ip_full_before_numeric_route_inspection(self):
+        self.env["IP_FULL_MISSING"] = "1"
+        self.setup_router()
+        self.assertTrue((self.root / "ip-full-installed").exists())
+        self.assertIn("wg0", self.config("network"))
+
+    def check_no_snapshot_retry(self, failure):
+        self.setup_router()
+        shutil.rmtree(self.root / "etc/cellbridge-backup")
+        self.env[failure] = "1"
+        self.run_script("cellbridge-revert.sh", success=False)
+        self.assertNotIn("wg0", self.config("network"))
+        self.env.pop(failure)
+        self.run_script("cellbridge-revert.sh")
+        self.assertNotIn("cellbridge_vpn", self.config("firewall"))
+        self.assertNotIn("cellbridge_fwd", self.config("firewall"))
+        self.assertFalse((self.root / "etc/cellbridge-installed").exists())
+        self.assertFalse((self.root / "etc/cellbridge-cleanup").exists())
+
+    def test_no_snapshot_retry_retains_proven_inventory_after_firewall_failure(self):
+        self.check_no_snapshot_retry("FAIL_FIREWALL_MEMBERSHIP")
+
+    def test_no_snapshot_retry_retains_proven_inventory_after_reload_failure(self):
+        self.check_no_snapshot_retry("FAIL_FIREWALL_RELOAD")
+
+    def test_lost_inventory_snapshot_metadata_cannot_be_recaptured(self):
+        self.setup_router()
+        backup = self.root / "etc/cellbridge-backup"
+        (backup / "phones-file-snapshot").unlink()
+        before = (self.root / "etc/config/network").read_bytes()
+        self.run_script("cellbridge-setup.sh", success=False)
+        self.assertFalse((backup / "phones-file-snapshot").exists())
+        self.run_script("cellbridge-revert.sh", success=False)
+        self.assertEqual((self.root / "etc/config/network").read_bytes(), before)
+
+    def test_version_two_snapshot_can_upgrade_once_without_recapturing_originals(self):
+        self.setup_router()
+        backup = self.root / "etc/cellbridge-backup"
+        (backup / "snapshot-version").write_text("2\n")
+        (backup / "phones-file-snapshot").unlink()
+        (self.root / "etc/cellbridge-phones.conf").unlink()
+        self.setup_router()
+        self.assertEqual((backup / "snapshot-version").read_text(), "3\n")
+        self.run_script("cellbridge-revert.sh")
+        self.assertFalse((self.root / "etc/cellbridge-phones.conf").exists())
+
+    def test_explicit_dns_is_global_when_adding_backup(self):
+        self.run_script("cellbridge-setup.sh")
+        main = self.config("network")["wg0"]
+        self.run_script("cellbridge-setup.sh", "--add-phone", "--dns", "9.9.9.9")
+        self.assertEqual(self.config("dhcp")["dns"]["server"], ["9.9.9.9"])
+        self.assertEqual(self.config("network")["wg0"], main)
+
+    def test_add_phone_refuses_static_uci_subnet_overlap(self):
+        self.setup_router()
+        network = self.config("network")
+        network["other_lan"] = {"_type": "interface", "proto": "static",
+                                "ipaddr": "10.10.1.1", "netmask": "255.255.0.0"}
+        path = self.root / "etc/config/network"
+        path.write_text(json.dumps(network))
+        before = path.read_bytes()
+        self.run_script("cellbridge-setup.sh", "--add-phone", success=False)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_phone_cap_and_invalid_target_are_rejected_without_edits(self):
+        network = self.config("network")
+        lines = []
+        for n in range(8):
+            network[f"wg{n}"] = {"_type": "interface", "proto": "wireguard", "cellbridge_managed": "1",
+                                  "addresses": [f"10.10.{10+n}.1/24"], "listen_port": str(51820+10*n)}
+            lines.append(f"wg{n} 10.10.{10+n}.1 {51820+10*n} {51821+10*n} {10*(n+1)} -")
+        path = self.root / "etc/config/network"
+        path.write_text(json.dumps(network))
+        (self.root / "etc/cellbridge-phones.conf").write_text("\n".join(lines) + "\n")
+        before = path.read_bytes()
+        for args in (("--add-phone",), ("--phone", "wg8"), ("--add-phone", "--phone", "wg1"), ("--priority", "")):
+            with self.subTest(args=args):
+                self.run_script("cellbridge-setup.sh", *args, success=False)
+                self.assertEqual(path.read_bytes(), before)
 
 
 if __name__ == "__main__":

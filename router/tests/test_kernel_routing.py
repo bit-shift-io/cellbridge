@@ -22,7 +22,7 @@ def ip(*args, ok=True):
     if ok and p.returncode:
         raise AssertionError(p.stderr)
     return p
-for name, address in (("br-lan", "192.168.50.1/24"), ("wan", "192.0.2.2/24"), ("wg0", "10.10.10.1/24")):
+for name, address in (("br-lan", "192.168.50.1/24"), ("wan", "192.0.2.2/24"), ("wg0", "10.10.10.1/24"), ("wg1", "10.10.11.1/24")):
     ip("link", "add", name, "type", "dummy")
     ip("addr", "add", address, "dev", name)
     ip("link", "set", name, "up")
@@ -53,6 +53,44 @@ def wait_path(path):
 
 def probe_route():
     return ip("route", "get", "1.1.1.1", "from", "10.10.10.1", "oif", "wg0").stdout
+
+if os.environ["NS_SCENARIO"] == "multi":
+    def wait_selected(name):
+        deadline = time.monotonic() + 22
+        while time.monotonic() < deadline:
+            assert daemon.poll() is None, "monitor exited unexpectedly"
+            status = root / "run/status"
+            if status.exists() and f"selected={name}\n" in status.read_text():
+                return
+            time.sleep(0.05)
+        raise AssertionError("monitor failed to select " + name)
+    (root / "wg0-healthy").touch()
+    (root / "wg1-healthy").touch()
+    daemon = subprocess.Popen(["sh", worker, "run"], stderr=subprocess.PIPE, text=True)
+    try:
+        wait_selected("wg0")
+        assert "dev wg0" in selected_device()
+        assert not (root / "wg1-probed").exists(), "idle backup consumed cellular probes"
+        (root / "wg0-healthy").unlink()
+        wait_selected("wg1")
+        assert "dev wg1" in selected_device()
+        assert "table 51821" in probe_route()
+        backup_probe = ip("route", "get", "1.1.1.1", "from", "10.10.11.1", "oif", "wg1").stdout
+        assert "table 51831" in backup_probe and "dev wg1" in backup_probe
+        local = ip("route", "get", "192.168.50.3", "from", "192.168.50.2", "iif", "br-lan").stdout
+        assert "dev br-lan" in local
+        (root / "wg0-healthy").touch()
+        wait_selected("wg0")
+        assert "dev wg0" in selected_device()
+    finally:
+        daemon.terminate()
+        _, errors = daemon.communicate(timeout=10)
+        assert daemon.returncode == 0, errors
+    for table in ("51820", "51821", "51831"):
+        assert not ip("route", "show", "table", table, ok=False).stdout.strip()
+    assert "lookup 16800" in ip("rule", "show").stdout
+    assert "dev wan" in selected_device()
+    raise SystemExit(0)
 
 daemon = subprocess.Popen(["sh", worker, "run"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 try:
@@ -106,12 +144,26 @@ class KernelRoutingTests(unittest.TestCase):
             root = Path(tmp)
             (root / "bin").mkdir()
             curl = root / "bin/curl"
-            curl.write_text('#!/bin/sh\n[ -f "$NS_ROOT/healthy" ] || exit 28\nprintf 200\n')
+            curl.write_text('''#!/bin/sh
+if [ "$NS_SCENARIO" = multi ]; then
+    while [ "$1" != --interface ]; do shift; done
+    shift
+    touch "$NS_ROOT/$1-probed"
+    [ -f "$NS_ROOT/$1-healthy" ] || exit 28
+else
+    [ -f "$NS_ROOT/healthy" ] || exit 28
+fi
+printf 200
+''')
             curl.chmod(0o755)
+            config = root / "phones.conf"
+            if scenario == "multi":
+                config.write_text("wg0 10.10.10.1 51820 51821 10 main\nwg1 10.10.11.1 51830 51831 20 backup\n")
             result = subprocess.run(
                 ["unshare", "-Urn", sys.executable, "-c", KERNEL_SCENARIO],
                 env={**os.environ, "NS_ROOT": tmp, "NS_SCENARIO": scenario,
-                     "WORKER": str(WORKER), "CELLBRIDGE_RUN_DIR": str(root / "run"),
+                      "WORKER": str(WORKER), "CELLBRIDGE_RUN_DIR": str(root / "run"),
+                      "CELLBRIDGE_PHONES_FILE": str(config),
                      "PATH": f"{root / 'bin'}:{os.environ['PATH']}"},
                 capture_output=True, text=True, timeout=55,
             )
@@ -122,6 +174,9 @@ class KernelRoutingTests(unittest.TestCase):
 
     def test_foreign_routes_are_preserved_during_check_and_cleanup(self):
         self.run_scenario("foreign")
+
+    def test_two_phone_priority_reclaim_and_isolated_probe_tables(self):
+        self.run_scenario("multi")
 
 
 if __name__ == "__main__":

@@ -79,6 +79,15 @@ MONITOR=/usr/sbin/cellbridge-failover
 MONITOR_INIT=/etc/init.d/cellbridge-failover
 INSTALL_MARKER=/etc/cellbridge-installed
 RESTORED_MARKER=/etc/cellbridge-restored
+PHONES_FILE=/etc/cellbridge-phones.conf
+ADD_PHONE=0
+PHONE_EXPLICIT=0
+LIST_PHONES=0
+PRIORITY=
+LABEL=
+METADATA_ONLY=0
+NETWORK_OPTIONS=0
+DNS_EXPLICIT=0
 
 msg()  { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -153,6 +162,11 @@ Usage:
   sh cellbridge-setup.sh [options]
 
 Options:
+  --add-phone              add the lowest free phone index (up to 8 phones)
+  --phone wgN              target an existing phone (default wg0)
+  --priority N             unique preference; lower is preferred
+  --label NAME             display token (letters, digits, dot, dash, underscore)
+  --list-phones            read-only list of configured phones
   --phone-public-key KEY   optional phone-managed public key (skip generation)
   --dns ADDR               upstream resolver (repeatable, default 1.1.1.1)
   --wan-iface NAME         extra backup UCI interface (repeatable)
@@ -192,42 +206,71 @@ WAN_OVERRIDES=
 
 while [ $# -gt 0 ]; do
 	case "$1" in
+	--add-phone) ADD_PHONE=1; shift ;;
+	--list-phones) LIST_PHONES=1; shift ;;
+	--phone|--priority|--label)
+		[ $# -ge 2 ] || die "$1 needs a value"
+		[ -n "$2" ] || die "$1 needs a nonempty value"
+		case "$1" in
+		--phone) WG_IF=$2; PHONE_EXPLICIT=1 ;;
+		--priority) PRIORITY=$2; METADATA_ONLY=1 ;;
+		--label) LABEL=$2; METADATA_ONLY=1 ;;
+		esac
+		shift 2 ;;
+	--phone=*|--priority=*|--label=*)
+		[ -n "${1#*=}" ] || die "${1%%=*} needs a nonempty value"
+		case "$1" in
+		--phone=*) WG_IF=${1#*=}; PHONE_EXPLICIT=1 ;;
+		--priority=*) PRIORITY=${1#*=}; METADATA_ONLY=1 ;;
+		--label=*) LABEL=${1#*=}; METADATA_ONLY=1 ;;
+		esac
+		shift ;;
 	--phone-public-key)
+		NETWORK_OPTIONS=1
 		[ $# -ge 2 ] || die "--phone-public-key needs a value"
 		PHONE_PUB=$2
 		MANUAL_PHONE_KEY=1
 		shift 2
 		;;
 	--phone-public-key=*)
+		NETWORK_OPTIONS=1
 		PHONE_PUB=${1#*=}
 		MANUAL_PHONE_KEY=1
 		shift
 		;;
 	--dns)
+		NETWORK_OPTIONS=1
+		DNS_EXPLICIT=1
 		[ $# -ge 2 ] || die "--dns needs a value"
 		DNS_LIST="$DNS_LIST $2"
 		shift 2
 		;;
 	--dns=*)
+		NETWORK_OPTIONS=1
+		DNS_EXPLICIT=1
 		DNS_LIST="$DNS_LIST ${1#*=}"
 		shift
 		;;
 	--wan-iface)
+		NETWORK_OPTIONS=1
 		[ $# -ge 2 ] || die "--wan-iface needs a value"
 		WAN_OVERRIDES="$WAN_OVERRIDES $2"
 		shift 2
 		;;
 	--wan-iface=*)
+		NETWORK_OPTIONS=1
 		WAN_OVERRIDES="$WAN_OVERRIDES ${1#*=}"
 		shift
 		;;
 	--port)
+		NETWORK_OPTIONS=1
 		[ $# -ge 2 ] || die "--port needs a value"
 		WG_PORT=$2
 		WG_PORT_EXPLICIT=1
 		shift 2
 		;;
 	--port=*)
+		NETWORK_OPTIONS=1
 		WG_PORT=${1#*=}
 		WG_PORT_EXPLICIT=1
 		shift
@@ -245,6 +288,17 @@ while [ $# -gt 0 ]; do
 		;;
 	esac
 done
+
+[ "$ADD_PHONE$PHONE_EXPLICIT" != 11 ] || die "--add-phone and --phone are mutually exclusive"
+case "$WG_IF" in wg[0-7]) : ;; *) die "--phone must be wg0 through wg7" ;; esac
+if [ -n "$PRIORITY" ]; then
+	case "$PRIORITY" in *[!0-9]*) die "--priority must be a positive integer" ;; esac
+	[ "${#PRIORITY}" -le 10 ] && [ "$PRIORITY" -ge 1 ] && [ "$PRIORITY" -le 2147483647 ] || die "invalid --priority"
+fi
+if [ -n "$LABEL" ]; then
+	case "$LABEL" in *[!A-Za-z0-9_.-]*) die "invalid --label" ;; esac
+	[ "${#LABEL}" -le 64 ] || die "--label is too long"
+fi
 
 [ -n "$DNS_LIST" ] || DNS_LIST=$DEFAULT_DNS
 
@@ -274,11 +328,91 @@ done
 command -v uci >/dev/null 2>&1 || die "uci not found; is this OpenWrt?"
 command -v ip  >/dev/null 2>&1 || die "ip not found"
 [ -d /etc/config ] || die "/etc/config not found; is this OpenWrt?"
+[ ! -e /etc/cellbridge-cleanup ] || die "a previous cleanup is incomplete; finish revert before setup"
 
 uci -q get 'dhcp.@dnsmasq[0]' >/dev/null 2>&1 ||
 	die "no dnsmasq section in /etc/config/dhcp; refusing to guess"
 [ -f "$MONITOR_SOURCE" ] || die "copy cellbridge-failover.sh beside this setup script first"
 sh -n "$MONITOR_SOURCE" || die "the companion monitor has invalid shell syntax"
+
+# Interface ownership is explicit. Only a proven pre-marker wg0 may migrate.
+legacy_phone() {
+	[ "$1" = wg0 ] || return 1
+	[ -f "$INSTALL_MARKER" ] || [ -f "$STATE_DIR/snapshot-complete" ] || return 1
+	[ "$(uci -q get network.wg0.proto)" = wireguard ] || return 1
+	[ "$(uci -q get network.wg0.addresses)" = 10.10.10.1/24 ] || return 1
+	[ "$(uci -q show network | awk -F= '$2 == "wireguard_wg0" {n++} END {print n+0}')" = 1 ] || return 1
+	[ "$(uci -q get 'network.@wireguard_wg0[0].allowed_ips')" = 0.0.0.0/0 ] &&
+		[ "$(uci -q get 'network.@wireguard_wg0[0].route_allowed_ips')" = 0 ]
+}
+
+phones=
+if [ -e "$PHONES_FILE" ]; then
+	phones=$(CELLBRIDGE_PHONES_FILE="$PHONES_FILE" sh "$MONITOR_SOURCE" phones) || die "invalid phone configuration; repair $PHONES_FILE"
+elif [ -n "$(uci -q get network.wg0)" ]; then
+	if [ "$(uci -q get network.wg0.cellbridge_managed)" = 1 ] || legacy_phone wg0; then
+		legacy_port=$(uci -q get network.wg0.listen_port)
+		phones="wg0 10.10.10.1 $legacy_port 51821 10 -"
+	fi
+fi
+if [ "$LIST_PHONES" = 1 ]; then
+	if [ -n "$phones" ]; then printf '%s\n' "$phones"; else msg 'No configured phones'; fi
+	exit 0
+fi
+
+# Do not let stale inventory silently rotate credentials or overwrite a tunnel.
+if [ -n "$phones" ]; then
+	while read -r p_if p_source p_port p_table p_priority p_label; do
+		[ "$(uci -q get "network.$p_if.cellbridge_managed")" = 1 ] || legacy_phone "$p_if" || die "cannot establish ownership of $p_if"
+		[ "$(uci -q get "network.$p_if.proto")" = wireguard ] &&
+			[ "$(uci -q get "network.$p_if.addresses")" = "$p_source/24" ] &&
+			[ "$(uci -q get "network.$p_if.listen_port")" = "$p_port" ] || die "phone configuration disagrees with UCI for $p_if; repair before retrying"
+	done <<EOF
+$phones
+EOF
+fi
+
+if [ "$ADD_PHONE" = 1 ]; then
+	index=0 free_index=
+	while [ "$index" -lt 8 ]; do
+		if ! printf '%s\n' "$phones" | awk -v name="wg$index" '$1==name {found=1} END {exit !found}'; then
+			[ -z "$(uci -q get "network.wg$index")" ] || die "stale wg$index exists in UCI; explicitly repair it before adding a phone"
+			[ -n "$free_index" ] || free_index=$index
+		fi
+		index=$((index+1))
+	done
+	[ -n "$free_index" ] || die "phone limit reached (8)"
+	WG_IF=wg$free_index
+fi
+index=${WG_IF#wg}
+WG_ADDR_HOST=10.10.$((10+index)).1
+WG_ADDR=$WG_ADDR_HOST/24
+PHONE_ADDR=10.10.$((10+index)).2/24
+PROBE_TABLE=$((51821+10*index))
+[ "$WG_PORT_EXPLICIT" = 1 ] || WG_PORT=$((51820+10*index))
+existing_record=$(printf '%s\n' "$phones" | awk -v name="$WG_IF" '$1==name')
+if [ -n "$(uci -q get "network.$WG_IF")" ]; then
+	[ "$(uci -q get "network.$WG_IF.cellbridge_managed")" = 1 ] || legacy_phone "$WG_IF" || die "refusing to adopt unrelated $WG_IF"
+elif [ "$PHONE_EXPLICIT" = 1 ]; then
+	die "--phone targets an existing phone; use --add-phone"
+fi
+if [ -n "$existing_record" ]; then
+	[ -n "$PRIORITY" ] || PRIORITY=$(printf '%s\n' "$existing_record" | awk '{print $5}')
+	[ -n "$LABEL" ] || LABEL=$(printf '%s\n' "$existing_record" | awk '{print $6}')
+fi
+[ -n "$PRIORITY" ] || PRIORITY=$((10*(index+1)))
+[ -n "$LABEL" ] || LABEL=-
+printf '%s\n' "$phones" | awk -v name="$WG_IF" -v priority="$PRIORITY" '$1!=name && $5==priority {exit 1}' || die "priority is already used; choose --priority"
+
+write_phones() {
+	# Publish only a fully validated file, with root-only permissions from umask.
+	{
+		printf '%s\n' "$phones" | awk -v name="$WG_IF" 'NF && $1!=name'
+		printf '%s %s %s %s %s %s\n' "$WG_IF" "$WG_ADDR_HOST" "$WG_PORT" "$PROBE_TABLE" "$PRIORITY" "$LABEL"
+	} | sort -k1,1 > "$PHONES_FILE.new" || die "cannot write phone configuration"
+	CELLBRIDGE_PHONES_FILE="$PHONES_FILE.new" sh "$MONITOR_SOURCE" phones >/dev/null || die "invalid proposed phone configuration"
+	chmod 600 "$PHONES_FILE.new" && mv "$PHONES_FILE.new" "$PHONES_FILE" || die "cannot publish phone configuration"
+}
 [ -x /etc/init.d/kmwan ] && [ "$(uci -q get kmwan.global.enable)" = 1 ] ||
 	die "this failover setup requires GL.iNet kmwan enabled for physical uplinks"
 for path in "$MONITOR" "$MONITOR_INIT"; do
@@ -350,7 +484,11 @@ take_snapshot() {
 		[ -f "$STATE_DIR/snapshot-complete" ] ||
 			die "incomplete snapshot retained; repair it before retrying setup"
 		if [ -f "$STATE_DIR/snapshot-version" ]; then
-			[ "$(cat "$STATE_DIR/snapshot-version")" = 2 ] || die "unsupported snapshot version"
+			case "$(cat "$STATE_DIR/snapshot-version")" in
+			2) : ;; # One-time extension of the genuine single-phone format.
+			3) [ -f "$STATE_DIR/phones-file-snapshot" ] || die "completed snapshot is missing phone inventory metadata" ;;
+			*) die "unsupported snapshot version" ;;
+			esac
 			for item in kmwan-snapshot managed-files-snapshot failover-enabled failover-running; do
 				[ -f "$STATE_DIR/$item" ] || die "completed snapshot is missing metadata: $item"
 			done
@@ -365,6 +503,13 @@ take_snapshot() {
 			done
 		elif [ -e "$INSTALL_MARKER" ] || [ -e "$MONITOR" ] || [ -e "$MONITOR_INIT" ]; then
 			die "snapshot version is missing; refusing to recapture installed files"
+		fi
+		if [ -f "$STATE_DIR/phones-file-snapshot" ]; then
+			case "$(cat "$STATE_DIR/phones-file-snapshot")" in
+			present) [ -f "$STATE_DIR/phones-config" ] || die "completed backup is missing phone inventory" ;;
+			absent) : ;;
+			*) die "invalid phone inventory snapshot metadata" ;;
+			esac
 		fi
 	fi
 	# A completed snapshot is immutable. Filling a lost file from today's
@@ -397,7 +542,7 @@ take_snapshot() {
 	chmod 700 "$STATE_DIR" 2>/dev/null || true
 	# Explicitly mark the new format before copying any payload. A legacy
 	# complete snapshot may be extended once, but damaged v2 metadata never is.
-	snapshot_marker snapshot-version 2 || die "cannot record snapshot version"
+	snapshot_marker snapshot-version 3 || die "cannot record snapshot version"
 
 	for cfg in network firewall dhcp; do
 		if [ -f "$STATE_DIR/$cfg" ]; then
@@ -455,6 +600,14 @@ take_snapshot() {
 			: > "$STATE_DIR/wan-sections"
 		fi
 	fi
+	if [ ! -f "$STATE_DIR/phones-file-snapshot" ]; then
+		if [ -f "$PHONES_FILE" ]; then
+			copy_snapshot_file "$PHONES_FILE" "$STATE_DIR/phones-config" || die "cannot back up phone configuration"
+			snapshot_marker phones-file-snapshot present || die "cannot record phone configuration snapshot"
+		else
+			snapshot_marker phones-file-snapshot absent || die "cannot record absent phone configuration"
+		fi
+	fi
 
 	if [ ! -f "$STATE_DIR/dns-upstream" ]; then
 		{
@@ -503,6 +656,59 @@ msg "WireGuard UDP port: $WG_PORT"
 msg "Snapshot directory: $STATE_DIR"
 # Refuse a conflicting listener before the snapshot and before any config edit.
 check_wg_port_available
+ensure_failover_tools() {
+	packages=
+	command -v curl >/dev/null 2>&1 || packages="$packages curl"
+	ip -Version 2>/dev/null | grep -q iproute2 || packages="$packages ip-full"
+	[ -s /etc/ssl/certs/ca-certificates.crt ] || packages="$packages ca-bundle"
+	if [ -n "$packages" ]; then
+		opkg update || die "cannot refresh packages; no routing changes made"
+		# Intentional splitting: packages is a list of fixed package names.
+		opkg install $packages || die "cannot install failover tools; no routing changes made"
+	fi
+	command -v curl >/dev/null 2>&1 || die "curl is unavailable"
+	ip -Version 2>/dev/null | grep -q iproute2 || die "ip-full is required for policy routing"
+	[ -s /etc/ssl/certs/ca-certificates.crt ] || die "a CA bundle is required for HTTPS health checks"
+}
+# Numeric table inspection needs ip-full, which fresh OpenWrt may not have yet.
+ensure_failover_tools
+# Input: one IPv4 address/prefix or address/dotted-netmask per line.
+# Reject any overlapping assignment, including a broader static LAN subnet.
+subnets_are_free() {
+	awk -v octet="$((10+index))" '
+	function number(ip, a,n) {
+		n=split(ip,a,"."); if(n!=4) return -1
+		for(j=1;j<=4;j++) if(a[j]!~/^[0-9]+$/ || a[j]+0>255) return -1
+		return ((a[1]*256+a[2])*256+a[3])*256+a[4]
+	}
+	BEGIN {target=number("10.10." octet ".0")}
+	{
+		split($1,p,"/"); address=number(p[1]); if(address<0) next
+		if(p[2] ~ /\./) size=4294967296-number(p[2])
+		else {bits=(p[2]=="" ? 32 : p[2]+0); if(bits==0) next; size=2^(32-bits)}
+		if(size<=0) exit 1
+		start=int(address/size)*size
+		if(start<=target+255 && start+size-1>=target) exit 1
+	}'
+}
+# Include configured but down phones in port checks.
+for iface in $(uci -q show network | awk -F'[.=]' '/=interface$/ {print $2}'); do
+	[ "$iface" = "$WG_IF" ] && continue
+	[ "$(uci -q get "network.$iface.proto")" != wireguard ] ||
+		[ "$(uci -q get "network.$iface.listen_port")" != "$WG_PORT" ] || die "UDP $WG_PORT is configured on $iface; choose --port"
+	assignments=$(uci -q get "network.$iface.addresses")
+	netmask=$(uci -q get "network.$iface.netmask")
+	for address in $(uci -q get "network.$iface.ipaddr"); do
+		case "$address" in */*) : ;; *) address=$address/${netmask:-24} ;; esac
+		assignments="$assignments $address"
+	done
+	printf '%s\n' $assignments | subnets_are_free || die "tunnel subnet conflicts with $iface"
+done
+current_routes=$(ip -4 -N route show table all) || die "cannot inspect routing"
+printf '%s\n' "$current_routes" | awk -v own="$WG_IF" '
+	{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==own) next
+	if($1 ~ /^[0-9]+\./) print $1; else if($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+\./) print $2}' |
+	subnets_are_free || die "tunnel subnet is already routed"
 take_snapshot
 
 if [ -n "$WAN_SECTIONS" ]; then
@@ -563,31 +769,24 @@ if ! ensure_qrencode; then
 	warn "qrencode is unavailable; the phone settings will be printed as text"
 fi
 
-ensure_failover_tools() {
-	packages=
-	command -v curl >/dev/null 2>&1 || packages="$packages curl"
-	ip -Version 2>/dev/null | grep -q iproute2 || packages="$packages ip-full"
-	[ -s /etc/ssl/certs/ca-certificates.crt ] || packages="$packages ca-bundle"
-	if [ -n "$packages" ]; then
-		opkg update || die "cannot refresh packages; no routing changes made"
-		# Intentional splitting: packages is a list of fixed package names.
-		opkg install $packages || die "cannot install failover tools; no routing changes made"
-	fi
-	command -v curl >/dev/null 2>&1 || die "curl is unavailable"
-	ip -Version 2>/dev/null | grep -q iproute2 || die "ip-full is required for policy routing"
-	[ -s /etc/ssl/certs/ca-certificates.crt ] || die "a CA bundle is required for HTTPS health checks"
-}
-
 choose_phone_keys() {
 	[ "$MANUAL_PHONE_KEY" = 0 ] || return 0
-	if PHONE_PRIV=$(uci -q get 'network.@wireguard_wg0[0].cellbridge_phone_private_key'); then
+	if PHONE_PRIV=$(uci -q get "network.@wireguard_$WG_IF[0].cellbridge_phone_private_key"); then
 		is_wireguard_key "$PHONE_PRIV" || die "stored generated phone key is invalid; refusing to rotate it"
 		PHONE_PUB=$(printf '%s\n' "$PHONE_PRIV" | wg pubkey 2>/dev/null) ||
 			die "stored generated phone key is unusable; refusing to rotate it"
-		[ "$PHONE_PUB" = "$(uci -q get 'network.@wireguard_wg0[0].public_key')" ] ||
+		[ "$PHONE_PUB" = "$(uci -q get "network.@wireguard_$WG_IF[0].public_key")" ] ||
 			die "stored generated phone keys do not match the configured peer; repair the pair or specify --phone-public-key"
 		msg "Reusing generated phone keys for QR setup"
 	else
+		# Existing manual-key peers stay manual on an ordinary rerun.
+		stored_pub=$(uci -q get "network.@wireguard_$WG_IF[0].public_key")
+		if [ -n "$stored_pub" ]; then
+			is_wireguard_key "$stored_pub" || die "stored phone public key is invalid; refusing to rotate it"
+			PHONE_PUB=$stored_pub
+			PHONE_PRIV=
+			return 0
+		fi
 		PHONE_PRIV=$(wg genkey) || die "cannot generate phone keys"
 		is_wireguard_key "$PHONE_PRIV" || die "generated phone key has an unexpected shape"
 		PHONE_PUB=$(printf '%s\n' "$PHONE_PRIV" | wg pubkey 2>/dev/null) ||
@@ -597,10 +796,18 @@ choose_phone_keys() {
 	is_wireguard_key "$PHONE_PUB" || die "generated phone public key has an unexpected shape"
 }
 
-ensure_failover_tools
 # Check on EVERY run, including upgrades with an existing managed worker.
 sh "$MONITOR_SOURCE" check || die "cannot inspect routing or reserved tables/rules contain foreign entries"
 choose_phone_keys
+if [ "$METADATA_ONLY" = 1 ] && [ "$NETWORK_OPTIONS" = 0 ] && [ "$ADD_PHONE" = 0 ] &&
+	[ -n "$existing_record" ] && [ -x "$MONITOR_INIT" ] && [ -f "$PHONES_FILE" ] &&
+	[ "$(uci -q get "network.$WG_IF.cellbridge_managed")" = 1 ] && cmp -s "$MONITOR_SOURCE" "$MONITOR"; then
+	write_phones
+	"$MONITOR_INIT" stop && "$MONITOR_INIT" start || die "cannot restart monitor"
+	msg 'Phone preferences updated:'
+	cat "$PHONES_FILE"
+	exit 0
+fi
 # Record installation provenance separately from restored original managed files.
 printf '2\n' > "$INSTALL_MARKER.new" && mv "$INSTALL_MARKER.new" "$INSTALL_MARKER" ||
 	die "cannot record installation ownership"
@@ -655,6 +862,7 @@ configure_network() {
 	msg "Configuring network.$WG_IF"
 	uci set "network.$WG_IF=interface" || die "uci: cannot create $WG_IF"
 	uci set "network.$WG_IF.proto=wireguard" || die "uci: cannot set proto"
+	uci set "network.$WG_IF.cellbridge_managed=1" || die "uci: cannot mark interface ownership"
 	uci set "network.$WG_IF.listen_port=$WG_PORT" || die "uci: cannot set port"
 	uci set "network.$WG_IF.mtu=$WG_MTU" || die "uci: cannot set mtu"
 
@@ -675,8 +883,8 @@ configure_network() {
 	# Read the old preshared key first: a re-run must not rotate it, or an
 	# already-configured phone would stop handshaking.
 	had_peer=0
-	uci -q get 'network.@wireguard_wg0[0]' >/dev/null 2>&1 && had_peer=1
-	peer_psk=$(uci -q get 'network.@wireguard_wg0[0].preshared_key')
+	uci -q get "network.@wireguard_$WG_IF[0]" >/dev/null 2>&1 && had_peer=1
+	peer_psk=$(uci -q get "network.@wireguard_$WG_IF[0].preshared_key")
 	if is_wireguard_key "$peer_psk"; then
 		msg "Reusing the existing peer preshared key"
 	else
@@ -689,11 +897,11 @@ configure_network() {
 		fi
 	fi
 
-	while uci -q delete "network.@wireguard_wg0[0]" >/dev/null 2>&1; do
+	while uci -q delete "network.@wireguard_$WG_IF[0]" >/dev/null 2>&1; do
 		:
 	done
 
-	peer=$(uci add network wireguard_wg0) ||
+	peer=$(uci add network "wireguard_$WG_IF") ||
 		die "uci: cannot add the WireGuard peer"
 
 	uci set "network.$peer.public_key=$PHONE_PUB" ||
@@ -715,6 +923,7 @@ EOF
 		die "uci: cannot set allowed_ips"
 	uci set "network.$peer.route_allowed_ips=0" ||
 		die "uci: cannot set route_allowed_ips"
+	uci set "network.$peer.persistent_keepalive=25" || die "uci: cannot set keepalive"
 
 	uci commit network || die "uci commit network failed"
 	msg "Peer: $PHONE_PUB (allowed_ips 0.0.0.0/0, health-controlled default route)"
@@ -793,6 +1002,7 @@ configure_firewall() {
 	if [ -z "$zone" ]; then
 		zone=cellbridge_vpn
 		uci set "firewall.$zone=zone" || die "uci: cannot create the vpn zone"
+		uci set "firewall.$zone.cellbridge_managed=1" || die "cannot mark firewall zone"
 		msg "Created firewall zone section '$zone' (name 'vpn')"
 	else
 		msg "Reusing existing firewall zone '$zone' (name 'vpn')"
@@ -823,7 +1033,8 @@ configure_firewall() {
 	for sec in $(uci -q show firewall |
 		awk -F'[.=]' '/=forwarding$/ { print $2 }'); do
 		if [ "$(uci -q get "firewall.$sec.src")" = lan ] &&
-			[ "$(uci -q get "firewall.$sec.dest")" = vpn ]; then
+			[ "$(uci -q get "firewall.$sec.dest")" = vpn ] &&
+			[ "$(uci -q get "firewall.$sec.enabled")" != 0 ]; then
 			fwd=$sec
 		fi
 	done
@@ -831,10 +1042,11 @@ configure_firewall() {
 		fwd=cellbridge_fwd
 		uci set "firewall.$fwd=forwarding" ||
 			die "uci: cannot create the lan->vpn forwarding"
+		uci set "firewall.$fwd.cellbridge_managed=1" || die "cannot mark forwarding"
+		uci set "firewall.$fwd.src=lan"
+		uci set "firewall.$fwd.dest=vpn"
+		uci set "firewall.$fwd.enabled=1"
 	fi
-	uci set "firewall.$fwd.src=lan"
-	uci set "firewall.$fwd.dest=vpn"
-	uci set "firewall.$fwd.enabled=1"
 
 	uci commit firewall || die "uci commit firewall failed"
 	msg "Zone vpn: masquerade + MSS clamping on; lan -> vpn forwarding enabled"
@@ -858,9 +1070,10 @@ configure_dns() {
 chmod 600 /etc/config/network || die "cannot protect network key storage"
 ensure_private_key
 configure_network
-configure_backup_priority
+[ "$ADD_PHONE" = 1 ] || [ "$WG_IF" != wg0 ] || configure_backup_priority
 configure_firewall
-configure_dns
+if [ "$DNS_EXPLICIT" = 1 ] || { [ "$ADD_PHONE" = 0 ] && [ "$WG_IF" = wg0 ]; }; then configure_dns; fi
+write_phones
 install_failover_monitor
 
 # ---------------------------------------------------------------------------
@@ -877,7 +1090,11 @@ wg0_ready() {
 }
 
 bring_up_wg() {
-	/etc/init.d/network reload >/dev/null 2>&1 || true
+	if [ "$ADD_PHONE" = 1 ] || [ "$WG_IF" != wg0 ]; then
+		ifup "$WG_IF" >/dev/null 2>&1 || true
+	else
+		/etc/init.d/network reload >/dev/null 2>&1 || true
+	fi
 
 	# An address can exist while the link is still down (for example when the
 	# UDP port was rejected). ifup also repairs netifd's stale "up" state.
@@ -917,8 +1134,9 @@ else
 		warn "firewall reload returned an error"
 fi
 
-/etc/init.d/dnsmasq restart >/dev/null 2>&1 ||
-	warn "dnsmasq restart returned an error; DNS may need a manual restart"
+if [ "$DNS_EXPLICIT" = 1 ] || { [ "$ADD_PHONE" = 0 ] && [ "$WG_IF" = wg0 ]; }; then
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || warn "dnsmasq restart returned an error; DNS may need a manual restart"
+fi
 
 # Read-only check: the phone's handshake arrives on br-lan, so the LAN zone's
 # input policy governs UDP 51820.  Never change that policy here -- it is the
@@ -928,7 +1146,8 @@ if [ -n "$lan_zone" ]; then
 	lan_input=$(uci -q get "firewall.$lan_zone.input")
 	if [ "$lan_input" != ACCEPT ]; then
 		warn "the LAN firewall zone input policy is '$lan_input'; the phone's"
-		warn "handshake to UDP $WG_PORT may be dropped. Add an allow rule for"
+		configured_ports=$(awk '{printf "%s%s", separator, $3; separator=", "}' "$PHONES_FILE")
+		warn "handshakes to UDP ports $configured_ports may be dropped. Add allow rules for"
 		warn "the LAN zone rather than changing the zone policy (SSH uses it)."
 	fi
 fi
@@ -937,7 +1156,7 @@ fi
 # Keep the native physical-uplink controller and start tunnel health routing.
 # ---------------------------------------------------------------------------
 
-"$MONITOR" restart-kmwan || die "kmwan restart failed runtime checks; run revert to restore"
+[ "$ADD_PHONE" = 1 ] || [ "$WG_IF" != wg0 ] || "$MONITOR" restart-kmwan || die "kmwan restart failed runtime checks; run revert to restore"
 "$MONITOR_INIT" start || die "cannot start tunnel monitor; run revert to restore"
 
 # ---------------------------------------------------------------------------
@@ -967,7 +1186,7 @@ msg "== CellBridge is configured =="
 msg "Router WireGuard public key: ${router_pub:-UNAVAILABLE (run: wg show $WG_IF public-key)}"
 msg "Phone endpoint:              $lan_ip:$WG_PORT (UDP)"
 msg "Tunnel addresses:            router $WG_ADDR, phone $PHONE_ADDR"
-msg "DNS upstream (selected path): $(printf '%s' "$DNS_LIST" | sed 's/^ //')"
+msg "DNS upstream (selected path): $(uci -q get 'dhcp.@dnsmasq[0].server')"
 msg "Backup directory:            $STATE_DIR"
 msg ""
 msg "Phone WireGuard settings:"
@@ -1026,3 +1245,5 @@ msg "Tunnel internet is preferred after two good HTTPS checks; three failures se
 msg "USB is monitored by kmwan only when attached; no additional USB polling is installed."
 msg "Monitor status: /usr/sbin/cellbridge-failover status"
 msg "Monitor logs: logread -e cellbridge-failover"
+msg 'Configured phones (lower priority number is preferred):'
+cat "$PHONES_FILE"

@@ -38,13 +38,14 @@ LAN's **internet exit**, reached over a WireGuard pipe across the existing Wi-Fi
    network, bind the process to it, and bind the WireGuard socket to Wi-Fi.
 3. **Rust core (`rust/`)** — `boringtun` for the tunnel; `smoltcp` as a userspace IPv4
    stack that terminates TCP; a packet-level UDP forwarder; splicing to real sockets.
-4. **Router (`router/`)** — OpenWrt config that routes the LAN's internet into the phone's
-   peer and masquerades it.
+4. **Router (`router/`)** — OpenWrt config and health monitor that select the
+   highest-preference working phone and masquerade LAN traffic into its tunnel.
+   Up to eight phones have independent `wgN` interfaces, keys, ports and subnets.
 
 ## 4. Data flow
 
 1. A LAN client sends internet-bound traffic; the router's default route points it into
-   the `wg0` tunnel, masqueraded to the phone's tunnel address.
+   the selected `wgN` tunnel, masqueraded to its router-side tunnel address.
 2. `boringtun` on the phone decrypts it into inner IP packets.
 3. **TCP** is terminated by `smoltcp` and spliced to a real cellular-bound socket.
    **UDP** is rewritten at the packet level, preserving the client's destination port.
@@ -57,5 +58,12 @@ LAN's **internet exit**, reached over a WireGuard pipe across the existing Wi-Fi
   NAT another device's traffic without root.
 * **Health-based fallback** — prefer CellBridge, then USB tether, then WAN; see
   `docs/superpowers/specs/2026-10-25-router-failover-design.md`, which supersedes
-  the original fail-closed requirement.
+   the original fail-closed requirement.
+* **Strict phone priority** — the main phone reclaims after two good internet
+  rounds, even during backup traffic. One active table (`51820`) selects a
+  phone; independent probe tables (`51821+10*N`) isolate health checks. Idle
+  lower-preference phones receive Wi-Fi-only keepalives/checks every 25 seconds,
+  using no cellular data. HTTPS tests qualify fallback candidates and monitor
+  selected/higher-preference phones. See
+  `docs/superpowers/specs/2026-10-26-multi-phone-priority-design.md`.
 * **Transport, not privacy** — WireGuard is used because the router speaks it natively.

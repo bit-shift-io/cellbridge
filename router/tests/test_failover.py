@@ -14,8 +14,10 @@ import unittest
 WORKER = Path(__file__).resolve().parents[1] / "cellbridge-failover.sh"
 
 FAKE_COMMAND = r'''#!/usr/bin/env python3
-import json, os, pathlib, signal, sys
+import fcntl, json, os, pathlib, signal, sys
 p = pathlib.Path(os.environ["SIM_STATE"])
+lock = p.with_suffix(".lock").open("w")
+fcntl.flock(lock, fcntl.LOCK_EX)
 s = json.loads(p.read_text())
 cmd = pathlib.Path(sys.argv[0]).name
 a = sys.argv[1:]
@@ -29,7 +31,7 @@ if cmd == "ip":
         for rule in s["rules"]:
             words = rule.split()
             pref = words[1]
-            rest = " ".join(words[2:]).replace("protocol ", "proto ").replace("lookup main", "lookup 254").replace("10.10.10.1/32", "10.10.10.1")
+            rest = " ".join(words[2:]).replace("protocol ", "proto ").replace("lookup main", "lookup 254").replace("/32", "")
             if not rest.startswith("from "):
                 rest = "from all " + rest
             lines.append(pref + ": " + rest)
@@ -54,7 +56,9 @@ if cmd == "ip":
             else:
                 output = "\n".join(s["tables"].get(t, []))
         elif a[1] == "replace":
-            if t == "51820" and s.get("route_failure"):
+            mode = s.get("scenario", [{}])[s.get("cycle", 0)]
+            missing = mode.get("_missing", []) if isinstance(mode, dict) else []
+            if (t == "51820" and s.get("route_failure")) or ("dev" in a and a[a.index("dev") + 1] in missing):
                 rc = 2
             else:
                 # Distinct metrics may coexist (including unreachable guard).
@@ -69,6 +73,8 @@ if cmd == "ip":
 elif cmd == "curl":
     s["probes"].append(a)
     mode = s["scenario"][s["cycle"]]
+    if isinstance(mode, dict):
+        mode = mode.get(a[a.index("--interface") + 1], False)
     if mode == "secondary":
         good = "https://1.0.0.1/cdn-cgi/trace" in a
     else:
@@ -83,6 +89,11 @@ elif cmd == "sleep":
         os.kill(os.getppid(), signal.SIGTERM)
 elif cmd == "logger":
     s["logs"].append(" ".join(a))
+elif cmd == "date":
+    output = str(1000 + s["cycle"] * 2)
+elif cmd == "wg":
+    s.setdefault("wifi_checks", []).append([s["cycle"], *a])
+    output = "peer\t900" if a[-1] == "latest-handshakes" else "peer\t100\t200"
 else:
     raise RuntimeError(cmd)
 p.write_text(json.dumps(s))
@@ -93,17 +104,20 @@ sys.exit(rc)
 
 
 class FailoverTests(unittest.TestCase):
-    def run_monitor(self, scenario, *, route_failure=False, stale=False):
+    def run_monitor(self, scenario, *, route_failure=False, stale=False, phones=None):
         self.assertTrue(WORKER.exists(), "tunnel health monitor is not implemented")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bindir = root / "bin"
             bindir.mkdir()
-            for cmd in ("ip", "curl", "sleep", "logger"):
+            for cmd in ("ip", "curl", "sleep", "logger", "wg", "date"):
                 path = bindir / cmd
                 path.write_text(FAKE_COMMAND)
                 path.chmod(0o755)
             state = root / "state.json"
+            config = root / "phones.conf"
+            if phones is not None:
+                config.write_text(phones)
             main = ["default via 192.0.2.1 dev uplink metric 2"]
             state.write_text(json.dumps({
                 "scenario": scenario, "cycle": 0, "commands": [], "probes": [],
@@ -114,7 +128,8 @@ class FailoverTests(unittest.TestCase):
             result = subprocess.run(
                 ["sh", str(WORKER), "run"],
                 env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}",
-                     "SIM_STATE": str(state), "CELLBRIDGE_RUN_DIR": str(root / "run")},
+                     "SIM_STATE": str(state), "CELLBRIDGE_RUN_DIR": str(root / "run"),
+                     "CELLBRIDGE_PHONES_FILE": str(config)},
                 capture_output=True, text=True, timeout=20,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -168,6 +183,79 @@ class FailoverTests(unittest.TestCase):
     def test_restart_clears_stale_preferred_route_before_testing(self):
         data = self.run_monitor([False, True], stale=True)
         self.assertEqual(self.selected(data), [False, False])
+
+    PHONES = "wg0 10.10.10.1 51820 51821 10 main\nwg1 10.10.11.1 51830 51831 20 backup\n"
+
+    def test_idle_backup_has_no_https_probes_but_wifi_state_is_observed(self):
+        data = self.run_monitor([{"wg0": True, "wg1": True}] * 17, phones=self.PHONES)
+        self.assertTrue(self.selected(data)[-1])
+        self.assertEqual({p[p.index("--interface") + 1] for p in data["probes"]}, {"wg0"})
+        checks = [c for c in data["wifi_checks"] if c[1:3] == ["show", "wg1"]]
+        self.assertTrue(checks)
+        self.assertGreaterEqual(max(c[0] for c in checks), 13)
+        self.assertIn(["rule", "add", "priority", "0", "from", "10.10.11.1/32",
+                       "lookup", "51831", "protocol", "186"], data["commands"])
+
+    def test_main_failure_qualifies_backup_then_main_reclaims_without_wifi_change(self):
+        data = self.run_monitor(
+            [{"wg0": True, "wg1": True}] * 2
+            + [{"wg0": False, "wg1": True}] * 6
+            + [{"wg0": True, "wg1": True}] * 2, phones=self.PHONES)
+        devices = [next(("wg1" if "dev wg1" in r else "wg0" for r in sample.get("51820", [])), None)
+                   for sample in data["samples"]]
+        self.assertEqual(devices[:5], [None, "wg0", "wg0", "wg0", None])
+        self.assertIn("wg1", devices[5:8])
+        self.assertEqual(devices[-2:], ["wg1", "wg0"])
+
+    def test_failed_main_does_not_starve_backup_at_startup(self):
+        data = self.run_monitor([{"wg0": False, "wg1": True}] * 6, phones=self.PHONES)
+        self.assertTrue(any("dev wg1" in r for r in data["samples"][-1]["51820"]))
+
+    def test_disappearing_selected_device_cannot_block_backup_or_reuse_stale_health(self):
+        data = self.run_monitor(
+            [{"wg0": True, "wg1": True}] * 2
+            + [{"wg0": False, "wg1": True, "_missing": ["wg0"]}] * 5
+            + [{"wg0": False, "wg1": True}] * 3, phones=self.PHONES)
+        self.assertTrue(any("dev wg1" in r for r in data["samples"][6]["51820"]))
+        self.assertTrue(any("dev wg1" in r for r in data["samples"][-1]["51820"]))
+
+    def test_phone_file_validation_and_full_range_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "phones"
+            env = {**os.environ, "CELLBRIDGE_PHONES_FILE": str(config)}
+            for content in ("", self.PHONES + "wg1 10.10.11.1 51840 51831 30 duplicate\n",
+                            self.PHONES.replace("51831", "51821"),
+                            self.PHONES.replace("10.10.11.1", "10.10.10.1"),
+                            self.PHONES.replace("20 backup", "10 backup"),
+                            self.PHONES.replace("wg1", "wg8")):
+                config.write_text(content)
+                result = subprocess.run(["sh", str(WORKER), "phones"], env=env, capture_output=True)
+                self.assertNotEqual(result.returncode, 0, content)
+            config.write_text(self.PHONES)
+            result = subprocess.run(["sh", str(WORKER), "phones"], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, self.PHONES)
+
+    def test_cleanup_checks_all_allocations_even_without_phone_file(self):
+        # A partial install can leave wg7 routes without a configuration entry.
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                binary = root / "ip"
+                binary.write_text(FAKE_COMMAND)
+                binary.chmod(0o755)
+                route = ("default dev foreign proto 4 metric 10" if foreign else
+                         "default dev wg7 src 10.10.17.1 metric 10 proto 186")
+                state = root / "state.json"
+                state.write_text(json.dumps({"commands": [], "tables": {"51891": [route]}, "rules": []}))
+                result = subprocess.run(["sh", str(WORKER), "cleanup"], capture_output=True, text=True,
+                                        env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}",
+                                             "SIM_STATE": str(state), "CELLBRIDGE_RUN_DIR": str(root / "run"),
+                                             "CELLBRIDGE_PHONES_FILE": str(root / "absent")})
+                data = json.loads(state.read_text())
+                self.assertEqual(result.returncode == 0, not foreign, result.stderr)
+                self.assertEqual(data["tables"]["51891"], [route] if foreign else [])
 
 
 if __name__ == "__main__":

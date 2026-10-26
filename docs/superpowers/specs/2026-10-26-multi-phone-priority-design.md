@@ -1,6 +1,7 @@
 # Multi-phone CellBridge priority
 
-Status: design for review. No router changes have been made.
+Status: approved. Implementation and verification are tracked in
+`docs/superpowers/plans/2026-10-26-multi-phone-priority.md`.
 
 ## Intent
 
