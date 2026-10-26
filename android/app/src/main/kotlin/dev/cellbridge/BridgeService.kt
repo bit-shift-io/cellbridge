@@ -7,6 +7,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.os.*
 import android.service.quicksettings.TileService
+import dev.cellbridge.cellbridge.R
 import org.json.JSONObject
 
 /**
@@ -134,7 +135,7 @@ class BridgeService : Service() {
         // The status is the title; there is no longer a "CellBridge" title or
         // a content-text subtitle.
         return builder
-            .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+            .setSmallIcon(R.drawable.ic_cellbridge_notification)
             .setContentTitle(notificationTitle(status)).setOngoing(true)
             .setContentIntent(open).addAction(Notification.Action.Builder(null, "Disconnect", stop).build()).build()
     }
