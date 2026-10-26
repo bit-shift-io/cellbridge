@@ -12,7 +12,8 @@
     <application
         android:label="cellbridge"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round">
         <service android:name="dev.cellbridge.BridgeService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Continuous userspace WireGuard gateway from Wi-Fi LAN to cellular internet"/>
         </service>

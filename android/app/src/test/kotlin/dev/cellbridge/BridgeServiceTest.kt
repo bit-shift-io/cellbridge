@@ -21,6 +21,15 @@ class BridgeServiceTest {
         service.destroy()
     }
 
+    @Test fun notification_title_is_the_status_and_has_no_subtitle() {
+        // Title carries the status; the old "CellBridge" title and the
+        // content-text subtitle are gone.
+        assertEquals("Connected", notificationTitle("connected"))
+        assertEquals("Disconnected", notificationTitle("connecting"))
+        assertEquals("Disconnected", notificationTitle("idle"))
+        assertEquals("Disconnected", notificationTitle("error"))
+    }
+
     @Test fun boot_starts_native_service_only_when_configuration_exists() {
         val context = RuntimeEnvironment.getApplication()
         val store = object : ConfigStore {

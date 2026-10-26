@@ -88,8 +88,19 @@ LABEL=
 METADATA_ONLY=0
 NETWORK_OPTIONS=0
 DNS_EXPLICIT=0
+REGISTER=0
+APP_OUTPUT=0
 
-msg()  { printf '%s\n' "$*"; }
+# In app mode every diagnostic goes to stderr; the sole machine-readable
+# setup payload is the only thing written to stdout, so the phone can parse
+# stdout without mistaking progress text for a result.
+msg()  {
+	if [ "$APP_OUTPUT" = 1 ]; then
+		printf '%s\n' "$*" >&2
+	else
+		printf '%s\n' "$*"
+	fi
+}
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -167,6 +178,11 @@ Options:
   --priority N             unique preference; lower is preferred
   --label NAME             display token (letters, digits, dot, dash, underscore)
   --list-phones            read-only list of configured phones
+  --register               app mode: reuse the phone whose public key matches,
+                           otherwise add the next free phone (use with
+                           --phone-public-key and --priority)
+  --app-output             write diagnostics to stderr and only the machine
+                           setup payload to stdout
   --phone-public-key KEY   optional phone-managed public key (skip generation)
   --dns ADDR               upstream resolver (repeatable, default 1.1.1.1)
   --wan-iface NAME         extra backup UCI interface (repeatable)
@@ -207,6 +223,8 @@ WAN_OVERRIDES=
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--add-phone) ADD_PHONE=1; shift ;;
+	--register) REGISTER=1; shift ;;
+	--app-output) APP_OUTPUT=1; shift ;;
 	--list-phones) LIST_PHONES=1; shift ;;
 	--phone|--priority|--label)
 		[ $# -ge 2 ] || die "$1 needs a value"
@@ -290,6 +308,17 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$ADD_PHONE$PHONE_EXPLICIT" != 11 ] || die "--add-phone and --phone are mutually exclusive"
+[ "$REGISTER" = 0 ] || [ "$ADD_PHONE" = 0 ] || die "--register and --add-phone are mutually exclusive"
+[ "$REGISTER" = 0 ] || [ "$PHONE_EXPLICIT" = 0 ] || die "--register and --phone are mutually exclusive"
+if [ "$REGISTER" = 1 ]; then
+	[ "$MANUAL_PHONE_KEY" = 1 ] || die "--register needs --phone-public-key"
+fi
+[ "$APP_OUTPUT" = 0 ] || [ "$REGISTER" = 1 ] || die "--app-output is only supported with --register"
+if [ "$APP_OUTPUT" = 1 ]; then
+	# Reserve stdout for the final result, including output from subprocesses.
+	exec 3>&1
+	exec 1>&2
+fi
 case "$WG_IF" in wg[0-7]) : ;; *) die "--phone must be wg0 through wg7" ;; esac
 if [ -n "$PRIORITY" ]; then
 	case "$PRIORITY" in *[!0-9]*) die "--priority must be a positive integer" ;; esac
@@ -346,6 +375,19 @@ legacy_phone() {
 		[ "$(uci -q get 'network.@wireguard_wg0[0].route_allowed_ips')" = 0 ]
 }
 
+# Print the interface whose peer already uses the given public key, if any.
+find_phone_by_key() {
+	_key=$1
+	for _i in 0 1 2 3 4 5 6 7; do
+		[ -n "$(uci -q get "network.wg$_i")" ] || continue
+		_pk=$(uci -q get "network.@wireguard_wg$_i[0].public_key")
+		[ "$_pk" = "$_key" ] || continue
+		printf 'wg%s\n' "$_i"
+		return 0
+	done
+	return 1
+}
+
 phones=
 if [ -e "$PHONES_FILE" ]; then
 	phones=$(CELLBRIDGE_PHONES_FILE="$PHONES_FILE" sh "$MONITOR_SOURCE" phones) || die "invalid phone configuration; repair $PHONES_FILE"
@@ -370,6 +412,21 @@ if [ -n "$phones" ]; then
 	done <<EOF
 $phones
 EOF
+fi
+
+# App registration: reuse this phone's existing allocation when its public key
+# is already configured, so a retried or repeated setup never duplicates it.
+if [ "$REGISTER" = 1 ]; then
+	if matching=$(find_phone_by_key "$PHONE_PUB"); then
+		WG_IF=$matching
+		PHONE_EXPLICIT=1
+		msg "Reusing existing phone $WG_IF for the supplied public key"
+	else
+		# The first phone must run normal global router setup. Only subsequent
+		# phones use the non-disruptive add-phone path.
+		[ -z "$phones" ] || ADD_PHONE=1
+		msg "Registering a new phone for the supplied public key"
+	fi
 fi
 
 if [ "$ADD_PHONE" = 1 ]; then
@@ -1181,6 +1238,14 @@ if [ -z "$lan_ip" ]; then
 fi
 [ -n "$lan_ip" ] || lan_ip=192.168.8.1
 
+if [ "$APP_OUTPUT" = 1 ]; then
+	[ -n "$router_pub" ] || die "router public key is unavailable"
+	# Return before the manual/QR summary, which intentionally displays secrets.
+	printf 'CELLBRIDGE1:{"address":"%s","peerPublicKey":"%s","presharedKey":"%s","endpoint":"%s:%s","mtu":%s,"phonePublicKey":"%s"}\n' \
+		"$PHONE_ADDR" "$router_pub" "$peer_psk" "$lan_ip" "$WG_PORT" "$WG_MTU" "$PHONE_PUB" >&3
+	exit 0
+fi
+
 msg ""
 msg "== CellBridge is configured =="
 msg "Router WireGuard public key: ${router_pub:-UNAVAILABLE (run: wg show $WG_IF public-key)}"
@@ -1201,6 +1266,7 @@ msg "  MTU        = $WG_MTU"
 msg "  AllowedIPs = 0.0.0.0/0"
 msg ""
 if [ -z "$router_pub" ]; then
+	[ "$APP_OUTPUT" = 0 ] || die "cannot render the setup payload: the router public key is unavailable"
 	warn "cannot render the phone QR: the router public key is unavailable"
 else
 	phone_key_json=

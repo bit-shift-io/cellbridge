@@ -100,3 +100,13 @@ pub fn test_connection_json(json: &str, fd: i32) -> Result<(), String> {
         std::time::Duration::from_secs(15),
     ))
 }
+
+/// Own the connected Wi-Fi TCP descriptor before parsing any login input.
+#[cfg(unix)]
+pub fn router_setup_json(json: &str, fd: i32) -> Result<(), String> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if fd < 0 { return Err("Invalid router Wi-Fi descriptor".into()); }
+    let socket = std::net::TcpStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let request = serde_json::from_str(json).map_err(|_| "Invalid router setup input")?;
+    crate::provisioning::start(runtime()?, socket, request)
+}

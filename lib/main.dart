@@ -10,6 +10,7 @@ import 'src/settings_store.dart';
 import 'src/android_bridge.dart';
 import 'src/diagnostics_screen.dart';
 import 'src/qr_scan_screen.dart';
+import 'src/router_setup_screen.dart';
 
 /// Runs the dashboard against the simulated backend on desktop:
 ///
@@ -134,6 +135,13 @@ class _CellBridgeAppState extends State<CellBridgeApp> {
         builder: (_) => ConfigScreen(
           store: store,
           initialConfig: _config,
+          setupRouter: defaultTargetPlatform == TargetPlatform.android
+              ? (context, privateKey) => Navigator.of(context).push<bridge.BridgeConfig>(
+                  MaterialPageRoute(builder: (_) => RouterSetupScreen(
+                    store: store, existingPrivateKey: privateKey,
+                    bridgeRunning: () => bridge.bridgeApi.status().state != bridge.BridgeState.idle,
+                  )))
+              : null,
           testConnection: defaultTargetPlatform == TargetPlatform.android
               ? (config) =>
                     const MethodChannel('dev.cellbridge/bridge')

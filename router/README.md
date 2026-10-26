@@ -30,13 +30,14 @@ change. This supersedes the original fail-closed/no-backup design.
 - Record a baseline from a LAN client: `curl -4 https://ifconfig.me`.
 - Substitute your router's LAN address below; do not assume its default address.
 
-## Copy all three scripts
+## Copy all four scripts
 
 From the repository root:
 
 ```sh
 scp router/cellbridge-setup.sh router/cellbridge-revert.sh \
-    router/cellbridge-failover.sh root@ROUTER_LAN_ADDRESS:/root/
+    router/cellbridge-failover.sh router/cellbridge-provision.sh \
+    root@ROUTER_LAN_ADDRESS:/root/
 ssh root@ROUTER_LAN_ADDRESS
 ```
 
@@ -117,6 +118,32 @@ sh /root/cellbridge-setup.sh --phone-public-key 'PHONE_PUBLIC_KEY'
 That mode does not generate/store a phone private key or include one in the QR.
 Existing public-only QR codes remain supported by the app.
 
+## Set up from the app (no PC or QR)
+
+The CellBridge app can install these scripts and register itself over SSH, so a
+phone can set up a router on its own. In **Configuration → Set up router over
+Wi-Fi**, join the router's Wi-Fi and enter the router address, SSH port, the
+**root** SSH username and password, and a phone priority (1 highest). The app:
+
+- uploads the bundled scripts to a private temporary directory on the router
+  (SSH stdin, no SFTP);
+- shows the setup script output live and keeps it on screen if a step fails, so
+  you can copy it for troubleshooting;
+- pauses at **Waiting for router internet** and lets you fix the router's uplink
+  and tap **Retry**;
+- verifies the router's SSH host fingerprint before sending the password, and
+  reuses this phone's identity on retries so it is never registered twice;
+- imports the returned WireGuard settings and saves them.
+
+The SSH username and password are used only for that session and are never
+stored on the phone. Only the phone's WireGuard identity and the confirmed
+router host fingerprint are kept (encrypted). Keep a PC handy as a fallback:
+if setup reports an error, the on-screen output says what to fix, and
+`cellbridge-revert.sh` still restores the router. The first phone also installs
+any missing OpenWrt packages, so the router must reach the internet during setup.
+
+The QR and command-line flows below still work and are equivalent.
+
 ## Main and backup phones
 
 First upgrade an existing install by copying the updated scripts and rerunning
@@ -154,6 +181,20 @@ Adding a phone leaves other phones' interfaces and credentials alone. Monitor
 restart can briefly put LAN traffic onto USB/WAN until health is re-verified.
 Do the initial legacy upgrade before adding a phone so the original interface
 has its ownership marker and Wi-Fi-only keepalive configuration.
+
+### App provisioning internals
+
+The app drives `router/cellbridge-provision.sh`, which wraps setup for
+programmatic use:
+
+- `check-internet` exits `0` when the router has internet and `75` when it does
+  not, so the app knows to wait rather than proceed.
+- `register PUBLIC_KEY PRIORITY` takes a `mkdir` lock, re-checks internet, and
+  calls `cellbridge-setup.sh --register --app-output`. `--register` reuses the
+  phone whose public key already matches (otherwise adds the next free phone),
+  so retries never duplicate a phone. `--app-output` sends diagnostics to stderr
+  and exactly one `CELLBRIDGE1:` settings line to stdout, containing no phone
+  private key. Priorities from the app are 1–10.
 
 ## How failover works
 

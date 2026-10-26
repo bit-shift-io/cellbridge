@@ -24,6 +24,7 @@ class ConfigScreen extends StatefulWidget {
     this.keyApi,
     this.testConnection,
     this.scanSetupQr,
+    this.setupRouter,
   });
 
   /// Where a validated configuration is written.
@@ -48,6 +49,9 @@ class ConfigScreen extends StatefulWidget {
   ///
   /// Non-null only on Android; tests inject a fake.
   final Future<String?> Function(BuildContext context)? scanSetupQr;
+
+  /// Opens phone-driven setup; returned settings have already been saved.
+  final Future<BridgeConfig?> Function(BuildContext context, String? privateKey)? setupRouter;
 
   @override
   State<ConfigScreen> createState() => _ConfigScreenState();
@@ -85,7 +89,8 @@ class _ConfigScreenState extends State<ConfigScreen> {
   bool _saving = false;
   bool _scanning = false;
   bool _generating = false;
-  bool get _formBusy => _saving || _scanning || _generating;
+  bool _settingUp = false;
+  bool get _formBusy => _saving || _scanning || _generating || _settingUp;
   bool _testing = false;
   String? _testResult;
   int _testRevision = 0;
@@ -137,6 +142,37 @@ class _ConfigScreenState extends State<ConfigScreen> {
   }
 
   KeyApi get _keys => widget.keyApi ?? keyApi;
+
+  Future<void> _setupRouter() async {
+    if (_formBusy || _testing) return;
+    if (widget.bridgeRunning()) {
+      _showMessage('Disconnect the bridge before router setup.');
+      return;
+    }
+    setState(() => _settingUp = true);
+    try {
+      final key = _privateKey.text.trim();
+      final config = await widget.setupRouter!(context, key.isEmpty ? null : key);
+      if (!mounted || config == null) return;
+      _deriveDebounce?.cancel();
+      _deriveRequest++;
+      _suppressPrivateKeyListener = true;
+      _privateKey.text = config.privateKey;
+      _suppressPrivateKeyListener = false;
+      _address.text = config.address;
+      _peerPublicKey.text = config.peerPublicKey;
+      _presharedKey.text = config.presharedKey ?? '';
+      _endpoint.text = config.endpoint;
+      _mtu.text = '${config.mtu}';
+      await _derivePublicKey(config.privateKey);
+      if (!mounted) return;
+      widget.onSaved?.call(config);
+      _invalidateTestResult();
+      _showMessage('Router configured and phone settings saved.');
+    } catch (_) {
+      if (mounted) _showMessage('Could not open router setup.');
+    } finally { if (mounted) setState(() => _settingUp = false); }
+  }
 
   Future<void> _scanSetupQr() async {
     if (_formBusy) {
@@ -474,6 +510,12 @@ class _ConfigScreenState extends State<ConfigScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              if (widget.setupRouter != null) ...[
+                FilledButton.icon(key: const Key('config-setup-router'),
+                  onPressed: _formBusy || _testing ? null : _setupRouter,
+                  icon: const Icon(Icons.router_outlined), label: const Text('Set up router over Wi-Fi')),
+                const SizedBox(height: 8),
+              ],
               if (widget.scanSetupQr != null) ...[
                 OutlinedButton.icon(
                   key: const Key('config-scan-qr'),

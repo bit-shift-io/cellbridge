@@ -13,6 +13,18 @@ class NativeBridge : BridgeFacade {
     private external fun nativeStop()
     private external fun nativeSnapshot(): String
     private external fun nativeTestConnection(config: String, fd: Int)
+    private external fun nativeRouterSetup(request: String, fd: Int)
+    private external fun nativeRouterSetupSnapshot(): String
+    private external fun nativeCancelRouterSetup()
+    fun routerSetup(request: String, fd: Int) {
+        try { nativeRouterSetup(request, fd) }
+        catch (error: UnsatisfiedLinkError) {
+            android.os.ParcelFileDescriptor.adoptFd(fd).close()
+            throw error
+        }
+    }
+    fun routerSetupSnapshot(): String = nativeRouterSetupSnapshot()
+    fun cancelRouterSetup() = nativeCancelRouterSetup()
     fun testConnection(configJson: String, fd: Int) {
         try { nativeTestConnection(configJson, fd) }
         catch (error: UnsatisfiedLinkError) {

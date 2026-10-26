@@ -182,7 +182,14 @@ elif cmd == "ifup":
     if args[:1] == ["wg0"]:
         (root / "wg0-ifup").write_text(" ".join(args))
         (root / "wg0-down").unlink(missing_ok=True)
-elif cmd in ("ifdown", "modprobe", "curl", "logger", "logread", "sleep"):
+elif cmd == "curl":
+    if os.environ.get("NET_OFFLINE") == "1":
+        sys.exit(28)
+    print("200")
+elif cmd == "wget":
+    if os.environ.get("NET_OFFLINE") == "1":
+        sys.exit(1)
+elif cmd in ("ifdown", "modprobe", "logger", "logread", "sleep"):
     pass
 else:
     raise RuntimeError((cmd, args))
@@ -218,7 +225,7 @@ class InstallationTests(unittest.TestCase):
         (self.root / "etc/ssl/certs/ca-certificates.crt").write_text("fixture CA bundle")
         self.env = {**os.environ, "SANDBOX": str(self.root),
                     "PATH": f"{self.root / 'bin'}:{os.environ['PATH']}"}
-        for cmd in ("uci", "cp", "ip", "wg", "id", "qrencode", "opkg", "ifup", "ifdown", "fw4", "modprobe", "curl", "logger", "logread", "ifstatus", "jsonfilter", "sleep"):
+        for cmd in ("uci", "cp", "ip", "wg", "id", "qrencode", "opkg", "ifup", "ifdown", "fw4", "modprobe", "curl", "wget", "logger", "logread", "ifstatus", "jsonfilter", "sleep"):
             path = self.root / "bin" / cmd
             path.write_text(OPENWRT_COMMAND)
             path.chmod(0o755)
@@ -855,6 +862,60 @@ esac
         self.assertEqual((backup / "snapshot-version").read_text(), "3\n")
         self.run_script("cellbridge-revert.sh")
         self.assertFalse((self.root / "etc/cellbridge-phones.conf").exists())
+
+    def test_provision_internet_check_reports_offline_without_mutations(self):
+        self.env["NET_OFFLINE"] = "1"
+        result = self.run_script("cellbridge-provision.sh", "check-internet", success=False)
+        self.assertEqual(result.returncode, 75)
+        self.assertFalse((self.root / "etc/cellbridge-backup").exists())
+        self.env.pop("NET_OFFLINE")
+        self.run_script("cellbridge-provision.sh", "check-internet")
+
+    def test_provision_register_is_idempotent_for_the_same_public_key(self):
+        self.run_script("cellbridge-provision.sh", "register", KEY, "5")
+        self.assertEqual(self.phones(), "wg0 10.10.10.1 51820 51821 5 -\n")
+        peers = [v for v in self.config("network").values() if v["_type"] == "wireguard_wg0"]
+        self.assertEqual(peers[0]["public_key"], KEY)
+        self.assertEqual(peers[0]["preshared_key"], "A" * 43 + "=")
+        before = self.config("network")["wg0"]
+        result = self.run_script("cellbridge-provision.sh", "register", KEY, "5")
+        self.assertEqual(self.phones(), "wg0 10.10.10.1 51820 51821 5 -\n")
+        self.assertEqual(self.config("network")["wg0"], before)
+        # Only the router private key is ever generated; re-registration must
+        # not rotate the phone peer or generate extra keys.
+        self.assertEqual((self.root / "genkey-count").read_text(), "1")
+        payload = json.loads(
+            next(line for line in result.stdout.splitlines() if line.startswith("CELLBRIDGE1:"))
+            .removeprefix("CELLBRIDGE1:")
+        )
+        self.assertEqual(payload["phonePublicKey"], KEY)
+
+    def test_provision_register_rejects_occupied_priority_and_bad_range(self):
+        self.run_script("cellbridge-provision.sh", "register", KEY, "5")
+        before = (self.root / "etc/config/network").read_bytes()
+        other = "B" * 43 + "="
+        self.run_script("cellbridge-provision.sh", "register", other, "5", success=False)
+        self.assertEqual((self.root / "etc/config/network").read_bytes(), before)
+        for priority in ("0", "11", "x"):
+            self.run_script("cellbridge-provision.sh", "register", other, priority, success=False)
+
+    def test_app_output_stdout_is_only_the_machine_payload(self):
+        result = self.run_script("cellbridge-setup.sh", "--register", "--app-output",
+                                 "--phone-public-key", PHONE_PUBLIC, "--priority", "3")
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, result.stdout)
+        self.assertTrue(lines[0].startswith("CELLBRIDGE1:"), lines[0])
+        payload = json.loads(lines[0].removeprefix("CELLBRIDGE1:"))
+        self.assertEqual(payload["phonePublicKey"], PHONE_PUBLIC)
+        self.assertEqual(payload["address"], "10.10.10.2/24")
+        self.assertNotIn("phonePrivateKey", payload)
+        self.assertNotIn("PrivateKey", result.stdout)
+        self.assertNotIn("PresharedKey", result.stdout)
+        self.assertNotIn("PresharedKey", result.stderr)
+        self.assertNotIn(payload["presharedKey"], result.stderr)
+        self.assertIn("Configuring network.wg0", result.stderr)
+        self.assertEqual(self.config("kmwan")["usb"]["metric"], "1")
+        self.assertEqual(self.config("dhcp")["dns"]["server"], ["1.1.1.1"])
 
     def test_explicit_dns_is_global_when_adding_backup(self):
         self.run_script("cellbridge-setup.sh")

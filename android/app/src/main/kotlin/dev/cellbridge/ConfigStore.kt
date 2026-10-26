@@ -124,7 +124,7 @@ private const val ENCRYPTED_PREFS_FILE = "dev.cellbridge.settings"
  * the platform exception in one that names the failure. The wrapped message
  * carries no configuration values.
  */
-private fun openEncryptedPreferences(context: Context): SharedPreferences {
+internal fun openEncryptedPreferences(context: Context): SharedPreferences {
     try {
         @Suppress("DEPRECATION") // EncryptedSharedPreferences is the ruled-in store.
         val masterKey =

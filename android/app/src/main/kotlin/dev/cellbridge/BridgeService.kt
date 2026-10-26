@@ -9,6 +9,13 @@ import android.os.*
 import android.service.quicksettings.TileService
 import org.json.JSONObject
 
+/**
+ * The ongoing notification's title is the connection status itself, so the
+ * shade reads "Connected" or "Disconnected" rather than the app name.
+ */
+internal fun notificationTitle(status: String): String =
+    if (status == "connected") "Connected" else "Disconnected"
+
 /** Native service owns networking. No Flutter engine is created here. */
 class BridgeService : Service() {
     private lateinit var thread: HandlerThread
@@ -124,9 +131,11 @@ class BridgeService : Service() {
         val open = PendingIntent.getActivity(this, 0, packageManager.getLaunchIntentForPackage(packageName), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         @Suppress("DEPRECATION")
         val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL) else Notification.Builder(this)
+        // The status is the title; there is no longer a "CellBridge" title or
+        // a content-text subtitle.
         return builder
             .setSmallIcon(android.R.drawable.stat_sys_upload_done)
-            .setContentTitle("CellBridge").setContentText(status).setOngoing(true)
+            .setContentTitle(notificationTitle(status)).setOngoing(true)
             .setContentIntent(open).addAction(Notification.Action.Builder(null, "Disconnect", stop).build()).build()
     }
 

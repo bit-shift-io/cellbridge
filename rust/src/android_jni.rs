@@ -20,6 +20,35 @@ fn checked(env: &mut JNIEnv, operation: impl FnOnce(&mut JNIEnv) -> Result<(), S
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_cellbridge_NativeBridge_nativeRouterSetup(
+    mut env: JNIEnv, _this: JObject, request: JString, fd: jint,
+) {
+    checked(&mut env, |env| {
+        if fd < 0 { return Err("Invalid router Wi-Fi descriptor".into()); }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let json: String = env.get_string(&request).map_err(|_| "Invalid router setup input")?.into();
+        crate::native::router_setup_json(&json, owned.into_raw_fd())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_cellbridge_NativeBridge_nativeRouterSetupSnapshot(
+    mut env: JNIEnv, _this: JObject,
+) -> jstring {
+    match catch_unwind(AssertUnwindSafe(|| env.new_string(crate::provisioning::snapshot_json()))) {
+        Ok(Ok(value)) => value.into_raw(),
+        _ => { let _ = env.throw_new("java/lang/IllegalStateException", "Could not read router setup state"); std::ptr::null_mut() }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_cellbridge_NativeBridge_nativeCancelRouterSetup(
+    mut env: JNIEnv, _this: JObject,
+) {
+    checked(&mut env, |_| { crate::provisioning::cancel(); Ok(()) });
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_cellbridge_NativeBridge_nativeTestConnection(
     mut env: JNIEnv,
     _this: JObject,

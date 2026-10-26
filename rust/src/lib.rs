@@ -9,6 +9,7 @@ mod frb_generated; /* AUTO INJECTED BY flutter_rust_bridge. This line may not be
 mod gateway;
 mod keys;
 pub mod native;
+pub mod provisioning;
 mod stats;
 mod tcp;
 pub mod test_peer;
