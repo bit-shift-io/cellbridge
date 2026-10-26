@@ -169,7 +169,12 @@ class _CellBridgeAppState extends State<CellBridgeApp> {
     return MaterialApp(
       title: 'CellBridge',
       navigatorKey: _navigatorKey,
-      theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
+      theme: ThemeData(
+        colorSchemeSeed: Colors.teal,
+        brightness: Brightness.dark,
+        useMaterial3: true,
+      ),
+      themeMode: ThemeMode.dark,
       home: Dashboard(
         config: () => _config,
         actions: [

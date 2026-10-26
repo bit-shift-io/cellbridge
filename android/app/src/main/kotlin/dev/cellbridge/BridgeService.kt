@@ -1,10 +1,12 @@
 package dev.cellbridge
 
 import android.app.*
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.os.*
+import android.service.quicksettings.TileService
 import org.json.JSONObject
 
 /** Native service owns networking. No Flutter engine is created here. */
@@ -96,6 +98,14 @@ class BridgeService : Service() {
             }
         } else if (!connected) releaseWakeLock()
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(snapshot.optString("state")))
+        notifyTile()
+    }
+
+    private fun notifyTile() {
+        try {
+            TileService.requestListeningState(this, ComponentName(this, BridgeTileService::class.java))
+        } catch (_: Exception) {
+        }
     }
 
     private fun fail(message: String) {
@@ -103,6 +113,7 @@ class BridgeService : Service() {
         synchronized(serviceStateLock) {
             if (instance === this) lastSnapshot = JSONObject(idleSnapshot()).put("state", "error").put("error", message).toString()
         }
+        notifyTile()
         android.util.Log.e("CellBridge", message)
     }
 
@@ -129,6 +140,7 @@ class BridgeService : Service() {
                 synchronized(serviceStateLock) {
                     if (instance == null && JSONObject(lastSnapshot).optString("state") != "error") lastSnapshot = idleSnapshot()
                 }
+                notifyTile()
             }
             finally { releaseWakeLock(); thread.quitSafely() }
         }
