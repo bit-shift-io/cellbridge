@@ -25,6 +25,8 @@ class _FakeBridgeApi implements BridgeApi {
     txBytes: BigInt.from(0),
     rxBytes: BigInt.from(0),
     activeFlows: BigInt.from(0),
+    txBytesPerSec: BigInt.from(0),
+    rxBytesPerSec: BigInt.from(0),
   );
 }
 

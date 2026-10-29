@@ -21,4 +21,27 @@ void main() {
       expect(formatBytes(BigInt.from(340 * 1024)), '340 KiB');
     });
   });
+
+  group('formatMbps', () {
+    test('renders whole numbers at and above ten', () {
+      expect(formatMbps(BigInt.from(5000000)), '40'); // 40 Mbps
+      expect(formatMbps(BigInt.from(1250000)), '10'); // exactly 10 Mbps
+    });
+
+    test('renders one decimal below ten, dropping a trailing .0', () {
+      expect(formatMbps(BigInt.from(425000)), '3.4');
+      expect(formatMbps(BigInt.from(125000)), '1');
+    });
+
+    test('zero is zero', () {
+      expect(formatMbps(BigInt.zero), '0');
+    });
+    test('decimal ties round up consistently across skins', () {
+      expect(formatMbps(BigInt.from(18750)), '0.2');
+      expect(formatMbps(BigInt.from(118750)), '1');
+      expect(formatMbps(BigInt.from(1243750)), '10');
+      expect(formatMbps(BigInt.from(50000)), '0.4');
+      expect(formatMbps(BigInt.parse('18446744073709551615')), '147573952589676');
+    });
+  });
 }

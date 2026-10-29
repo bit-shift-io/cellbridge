@@ -80,6 +80,7 @@ pub fn snapshot_json() -> String {
         "state": format!("{:?}", status.state).to_lowercase(),
         "error": status.error,
         "txBytes": stats.tx_bytes.to_string(), "rxBytes": stats.rx_bytes.to_string(),
+        "txBytesPerSec": stats.tx_bytes_per_sec.to_string(), "rxBytesPerSec": stats.rx_bytes_per_sec.to_string(),
         "activeFlows": stats.active_flows.to_string(), "diagnostics": crate::diagnostics::snapshot()
     })
     .to_string()

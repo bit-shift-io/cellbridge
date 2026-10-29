@@ -30,6 +30,8 @@ class _ScriptedBridgeApi implements BridgeApi {
              txBytes: BigInt.zero,
              rxBytes: BigInt.zero,
              activeFlows: BigInt.zero,
+             txBytesPerSec: BigInt.zero,
+             rxBytesPerSec: BigInt.zero,
            );
 
   final List<BridgeStatus> _statuses;
@@ -103,6 +105,22 @@ FilledButton _toggle(WidgetTester tester) =>
     tester.widget<FilledButton>(find.byKey(const Key('connect-toggle')));
 
 void main() {
+  testWidgets('all five rows remain accessible on a short screen', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(320, 480);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    _useBridgeApi(_ScriptedBridgeApi());
+    await tester.pumpWidget(_app());
+    expect(tester.takeException(), isNull);
+    await tester.ensureVisible(find.byKey(const Key('active-flows')));
+    expect(find.byKey(const Key('active-flows')).hitTestable(), findsOneWidget);
+    expect(find.text('Download'), findsOneWidget);
+    expect(find.text('Upload'), findsOneWidget);
+    expect(find.text('0 Mbps'), findsNWidgets(2));
+  });
   testWidgets('shows Connecting then Connected as status is polled', (
     tester,
   ) async {
@@ -144,14 +162,18 @@ void main() {
           txBytes: BigInt.from(999),
           rxBytes: BigInt.from(1024),
           activeFlows: BigInt.from(3),
+          txBytesPerSec: BigInt.from(5000000), // 40 Mbps up
+          rxBytesPerSec: BigInt.from(3750000), // 30 Mbps down
         ),
       ),
     );
 
     await tester.pumpWidget(_app());
 
-    expect(_text(tester, 'bytes-in'), '1 KiB');
-    expect(_text(tester, 'bytes-out'), '999 B');
+    expect(_text(tester, 'bytes-download'), '1 KiB');
+    expect(_text(tester, 'bytes-upload'), '999 B');
+    expect(_text(tester, 'speed-down'), '30 Mbps');
+    expect(_text(tester, 'speed-up'), '40 Mbps');
     expect(_text(tester, 'active-flows'), '3');
   });
 

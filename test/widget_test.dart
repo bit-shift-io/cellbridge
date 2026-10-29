@@ -23,6 +23,8 @@ class _IdleBridgeApi implements BridgeApi {
     txBytes: BigInt.zero,
     rxBytes: BigInt.zero,
     activeFlows: BigInt.zero,
+    txBytesPerSec: BigInt.zero,
+    rxBytesPerSec: BigInt.zero,
   );
 }
 
@@ -86,9 +88,15 @@ void main() {
     await tester.pump(const Duration(milliseconds: 1600));
     expect(find.text('Connected'), findsOneWidget);
 
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(api.stats().rxBytesPerSec, greaterThan(BigInt.zero));
+    expect(api.stats().txBytesPerSec, greaterThan(BigInt.zero));
+
     await tester.tap(find.byKey(const Key('simulate-error')));
     await tester.pump(const Duration(milliseconds: 600));
     expect(find.byKey(const Key('last-error')), findsOneWidget);
+    expect(api.stats().rxBytesPerSec, BigInt.zero);
+    expect(api.stats().txBytesPerSec, BigInt.zero);
   });
 
   testWidgets('first launch with no saved config opens the config screen', (

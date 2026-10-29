@@ -80,6 +80,8 @@ class AndroidBridgeApi extends ChangeNotifier
     txBytes: BigInt.parse('${snapshot['txBytes'] ?? 0}'),
     rxBytes: BigInt.parse('${snapshot['rxBytes'] ?? 0}'),
     activeFlows: BigInt.parse('${snapshot['activeFlows'] ?? 0}'),
+    txBytesPerSec: BigInt.parse('${snapshot['txBytesPerSec'] ?? 0}'),
+    rxBytesPerSec: BigInt.parse('${snapshot['rxBytesPerSec'] ?? 0}'),
   );
   Future<String> cellularControl() async =>
       await channel

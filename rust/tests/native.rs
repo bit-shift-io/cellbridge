@@ -80,6 +80,8 @@ fn native_json_boundary_rejects_malformed_settings_and_keeps_snapshot_readable()
     let snapshot: serde_json::Value = serde_json::from_str(&native::snapshot_json()).unwrap();
     assert_eq!(snapshot["state"], "idle");
     assert_eq!(snapshot["txBytes"], "0");
+    assert_eq!(snapshot["txBytesPerSec"], "0");
+    assert_eq!(snapshot["rxBytesPerSec"], "0");
     assert!(snapshot["diagnostics"].is_array());
 }
 

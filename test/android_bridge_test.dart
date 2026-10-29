@@ -26,6 +26,8 @@ void main() {
             'txBytes': '9007199254740993',
             'rxBytes': '5',
             'activeFlows': '1',
+            'txBytesPerSec': '3750000',
+            'rxBytesPerSec': '5000000',
             'diagnostics': [],
             'binding': {'cellularBindVerified': true},
           });
@@ -62,6 +64,8 @@ void main() {
     await api.initialize();
     expect(api.status().state, BridgeState.connected);
     expect(api.stats().txBytes, BigInt.parse('9007199254740993'));
+    expect(api.stats().txBytesPerSec, BigInt.parse('3750000'));
+    expect(api.stats().rxBytesPerSec, BigInt.parse('5000000'));
     expect(calls, ['snapshot']);
     await api.stop();
     expect(api.status().state, BridgeState.idle);

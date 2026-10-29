@@ -38,6 +38,8 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
     txBytes: BigInt.zero,
     rxBytes: BigInt.zero,
     activeFlows: BigInt.zero,
+    txBytesPerSec: BigInt.zero,
+    rxBytesPerSec: BigInt.zero,
   );
 
   Timer? _pollTimer;
@@ -240,67 +242,83 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
       appBar: AppBar(title: const Text('CellBridge'), actions: widget.actions),
       body: Padding(
         padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Card(
-              child: ListTile(
-                leading: Icon(_isOn ? Icons.vpn_lock : Icons.vpn_lock_outlined),
-                title: Text(
-                  _stateLabel,
-                  key: const Key('status-text'),
-                  style: Theme.of(context).textTheme.titleLarge,
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Card(
+                child: ListTile(
+                  leading: Icon(
+                    _isOn ? Icons.vpn_lock : Icons.vpn_lock_outlined,
+                  ),
+                  title: Text(
+                    _stateLabel,
+                    key: const Key('status-text'),
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              key: const Key('connect-toggle'),
-              onPressed: _canToggle ? _toggle : null,
-              icon: Icon(_isOn ? Icons.link_off : Icons.link),
-              label: Text(_isOn ? 'Disconnect' : 'Connect'),
-            ),
-            const SizedBox(height: 16),
-            Card(
-              child: Column(
-                children: [
-                  _StatRow(
-                    label: 'In',
-                    value: formatBytes(_stats.rxBytes),
-                    valueKey: 'bytes-in',
-                  ),
-                  const Divider(height: 1),
-                  _StatRow(
-                    label: 'Out',
-                    value: formatBytes(_stats.txBytes),
-                    valueKey: 'bytes-out',
-                  ),
-                  const Divider(height: 1),
-                  _StatRow(
-                    label: 'Active flows',
-                    value: '${_stats.activeFlows}',
-                    valueKey: 'active-flows',
-                  ),
-                ],
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                key: const Key('connect-toggle'),
+                onPressed: _canToggle ? _toggle : null,
+                icon: Icon(_isOn ? Icons.link_off : Icons.link),
+                label: Text(_isOn ? 'Disconnect' : 'Connect'),
               ),
-            ),
-            if (errorText != null) ...[
               const SizedBox(height: 16),
               Card(
-                color: Theme.of(context).colorScheme.errorContainer,
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(
-                    errorText,
-                    key: const Key('last-error'),
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.onErrorContainer,
+                child: Column(
+                  children: [
+                    _StatRow(
+                      label: 'Download',
+                      value: formatBytes(_stats.rxBytes),
+                      valueKey: 'bytes-download',
+                    ),
+                    const Divider(height: 1),
+                    _StatRow(
+                      label: 'Upload',
+                      value: formatBytes(_stats.txBytes),
+                      valueKey: 'bytes-upload',
+                    ),
+                    const Divider(height: 1),
+                    _StatRow(
+                      label: 'Down',
+                      value: '${formatMbps(_stats.rxBytesPerSec)} Mbps',
+                      valueKey: 'speed-down',
+                    ),
+                    const Divider(height: 1),
+                    _StatRow(
+                      label: 'Up',
+                      value: '${formatMbps(_stats.txBytesPerSec)} Mbps',
+                      valueKey: 'speed-up',
+                    ),
+                    const Divider(height: 1),
+                    _StatRow(
+                      label: 'Active flows',
+                      value: '${_stats.activeFlows}',
+                      valueKey: 'active-flows',
+                    ),
+                  ],
+                ),
+              ),
+              if (errorText != null) ...[
+                const SizedBox(height: 16),
+                Card(
+                  color: Theme.of(context).colorScheme.errorContainer,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text(
+                      errorText,
+                      key: const Key('last-error'),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onErrorContainer,
+                      ),
                     ),
                   ),
                 ),
-              ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );

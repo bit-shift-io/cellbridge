@@ -44,7 +44,8 @@ class BridgeStatus {
           error == other.error;
 }
 
-/// A snapshot of what the bridge has moved and how many flows are live.
+/// A snapshot of what the bridge has moved, how fast, and how many flows are
+/// live.
 class Stats {
   /// Payload bytes sent from clients toward the real destinations (uplink).
   final BigInt txBytes;
@@ -55,15 +56,27 @@ class Stats {
   /// Live TCP splices plus tracked UDP flows.
   final BigInt activeFlows;
 
+  /// Smoothed uplink rate (bytes per second).
+  final BigInt txBytesPerSec;
+
+  /// Smoothed downlink rate (bytes per second).
+  final BigInt rxBytesPerSec;
+
   const Stats({
     required this.txBytes,
     required this.rxBytes,
     required this.activeFlows,
+    required this.txBytesPerSec,
+    required this.rxBytesPerSec,
   });
 
   @override
   int get hashCode =>
-      txBytes.hashCode ^ rxBytes.hashCode ^ activeFlows.hashCode;
+      txBytes.hashCode ^
+      rxBytes.hashCode ^
+      activeFlows.hashCode ^
+      txBytesPerSec.hashCode ^
+      rxBytesPerSec.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -72,5 +85,7 @@ class Stats {
           runtimeType == other.runtimeType &&
           txBytes == other.txBytes &&
           rxBytes == other.rxBytes &&
-          activeFlows == other.activeFlows;
+          activeFlows == other.activeFlows &&
+          txBytesPerSec == other.txBytesPerSec &&
+          rxBytesPerSec == other.rxBytesPerSec;
 }

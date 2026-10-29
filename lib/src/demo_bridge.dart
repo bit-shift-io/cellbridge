@@ -27,6 +27,8 @@ class DemoBridgeApi implements BridgeApi {
   String? _error;
   BigInt _tx = BigInt.zero;
   BigInt _rx = BigInt.zero;
+  BigInt _txRate = BigInt.zero;
+  BigInt _rxRate = BigInt.zero;
   int _flows = 0;
   Timer? _ticker;
   int _generation = 0;
@@ -42,6 +44,8 @@ class DemoBridgeApi implements BridgeApi {
     _error = null;
     _tx = BigInt.zero;
     _rx = BigInt.zero;
+    _txRate = BigInt.zero;
+    _rxRate = BigInt.zero;
     _flows = 0;
 
     await Future<void>.delayed(connectDelay);
@@ -63,6 +67,8 @@ class DemoBridgeApi implements BridgeApi {
     _error = null;
     _tx = BigInt.zero;
     _rx = BigInt.zero;
+    _txRate = BigInt.zero;
+    _rxRate = BigInt.zero;
     _flows = 0;
   }
 
@@ -76,12 +82,24 @@ class DemoBridgeApi implements BridgeApi {
     _ticker = null;
     _state = BridgeState.error;
     _error = message;
+    _txRate = BigInt.zero;
+    _rxRate = BigInt.zero;
     _flows = 0;
   }
 
   void _tick() {
-    _rx += BigInt.from(20 * 1024 + _random.nextInt(180 * 1024));
-    _tx += BigInt.from(8 * 1024 + _random.nextInt(90 * 1024));
+    final rxDelta = BigInt.from(20 * 1024 + _random.nextInt(180 * 1024));
+    final txDelta = BigInt.from(8 * 1024 + _random.nextInt(90 * 1024));
+    _rx += rxDelta;
+    _tx += txDelta;
+    _rxRate =
+        rxDelta *
+        BigInt.from(1000000) ~/
+        BigInt.from(tickInterval.inMicroseconds);
+    _txRate =
+        txDelta *
+        BigInt.from(1000000) ~/
+        BigInt.from(tickInterval.inMicroseconds);
     final drift = _random.nextInt(5) - 2;
     _flows = (_flows + drift).clamp(1, 24).toInt();
   }
@@ -90,6 +108,11 @@ class DemoBridgeApi implements BridgeApi {
   BridgeStatus status() => BridgeStatus(state: _state, error: _error);
 
   @override
-  Stats stats() =>
-      Stats(txBytes: _tx, rxBytes: _rx, activeFlows: BigInt.from(_flows));
+  Stats stats() => Stats(
+    txBytes: _tx,
+    rxBytes: _rx,
+    activeFlows: BigInt.from(_flows),
+    txBytesPerSec: _txRate,
+    rxBytesPerSec: _rxRate,
+  );
 }

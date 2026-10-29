@@ -45,7 +45,7 @@ pub fn status() -> BridgeStatus {
     bridge::status()
 }
 
-/// The current byte and flow counters.
+/// The current byte, flow and rate counters.
 #[frb(sync)]
 pub fn stats() -> Stats {
     bridge::stats()

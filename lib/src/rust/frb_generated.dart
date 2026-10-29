@@ -390,12 +390,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Stats dco_decode_stats(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 3)
-      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    if (arr.length != 5)
+      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
     return Stats(
       txBytes: dco_decode_u_64(arr[0]),
       rxBytes: dco_decode_u_64(arr[1]),
       activeFlows: dco_decode_usize(arr[2]),
+      txBytesPerSec: dco_decode_u_64(arr[3]),
+      rxBytesPerSec: dco_decode_u_64(arr[4]),
     );
   }
 
@@ -533,10 +535,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_txBytes = sse_decode_u_64(deserializer);
     var var_rxBytes = sse_decode_u_64(deserializer);
     var var_activeFlows = sse_decode_usize(deserializer);
+    var var_txBytesPerSec = sse_decode_u_64(deserializer);
+    var var_rxBytesPerSec = sse_decode_u_64(deserializer);
     return Stats(
       txBytes: var_txBytes,
       rxBytes: var_rxBytes,
       activeFlows: var_activeFlows,
+      txBytesPerSec: var_txBytesPerSec,
+      rxBytesPerSec: var_rxBytesPerSec,
     );
   }
 
@@ -669,6 +675,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_u_64(self.txBytes, serializer);
     sse_encode_u_64(self.rxBytes, serializer);
     sse_encode_usize(self.activeFlows, serializer);
+    sse_encode_u_64(self.txBytesPerSec, serializer);
+    sse_encode_u_64(self.rxBytesPerSec, serializer);
   }
 
   @protected

@@ -20,9 +20,11 @@
 //! ignored.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// A snapshot of what the bridge has moved and how many flows are live.
+/// A snapshot of what the bridge has moved, how fast, and how many flows are
+/// live.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Payload bytes sent from clients toward the real destinations (uplink).
@@ -31,6 +33,10 @@ pub struct Stats {
     pub rx_bytes: u64,
     /// Live TCP splices plus tracked UDP flows.
     pub active_flows: usize,
+    /// Smoothed uplink rate (bytes per second).
+    pub tx_bytes_per_sec: u64,
+    /// Smoothed downlink rate (bytes per second).
+    pub rx_bytes_per_sec: u64,
 }
 
 /// Where the bridge is in its lifecycle.
@@ -68,11 +74,70 @@ pub enum LinkEvent {
     Lost,
 }
 
-/// Lock-free payload byte counters shared between the data path and the reader.
+/// Time constant of the rate's exponential moving average.
+///
+/// Long enough to smooth a one-second sample into a steady readout, short
+/// enough that a real change shows up within a couple of seconds.
+const RATE_TAU_SECS: f64 = 2.0;
+
+/// The previous rate sample, so a smoothed rate can be derived from the
+/// cumulative counters without the data path ever taking a lock.
+#[derive(Debug, Default)]
+struct RateState {
+    /// `None` until the first sample primes the window.
+    last: Option<Instant>,
+    /// Byte counts as of the previous sample.
+    tx: u64,
+    rx: u64,
+    /// Smoothed bytes-per-second rates.
+    tx_rate: f64,
+    rx_rate: f64,
+}
+
+impl RateState {
+    /// Fold one sample in and return the smoothed rates.
+    ///
+    /// A zero interval (`dt == 0`, two reads in the same instant) is not a
+    /// sample: the pending delta is kept so the next real interval measures it.
+    fn sample(&mut self, tx: u64, rx: u64, now: Instant) -> (u64, u64) {
+        match self.last {
+            None => {
+                self.tx = tx;
+                self.rx = rx;
+                self.last = Some(now);
+            }
+            Some(prev) => {
+                let dt = now.duration_since(prev).as_secs_f64();
+                if dt > 0.0 {
+                    let inst_tx = tx.saturating_sub(self.tx) as f64 / dt;
+                    let inst_rx = rx.saturating_sub(self.rx) as f64 / dt;
+                    let alpha = 1.0 - (-dt / RATE_TAU_SECS).exp();
+                    self.tx_rate += (inst_tx - self.tx_rate) * alpha;
+                    self.rx_rate += (inst_rx - self.rx_rate) * alpha;
+                    self.tx = tx;
+                    self.rx = rx;
+                    self.last = Some(now);
+                }
+            }
+        }
+        (round_rate(self.tx_rate), round_rate(self.rx_rate))
+    }
+}
+
+fn round_rate(rate: f64) -> u64 {
+    rate.max(0.0).round() as u64
+}
+
+/// Payload byte counters shared between the data path and the reader.
+///
+/// The byte counters are lock-free atomics, so recording a packet never takes a
+/// lock. The smoothed rate is derived on read, under a small `Mutex` that only
+/// [`StatsCounters::snapshot`] and [`StatsCounters::reset`] ever touch.
 #[derive(Debug, Default)]
 pub struct StatsCounters {
     tx_bytes: AtomicU64,
     rx_bytes: AtomicU64,
+    rate: Mutex<RateState>,
 }
 
 impl StatsCounters {
@@ -91,13 +156,15 @@ impl StatsCounters {
         self.rx_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    /// Zero the byte counters.
+    /// Zero the byte counters and the rate.
     ///
     /// Used when the bridge stops, so a fresh run starts from zero rather than
-    /// inheriting the previous run's totals.
+    /// inheriting the previous run's totals or rate.
     pub fn reset(&self) {
+        let mut rate = self.rate.lock().unwrap_or_else(|e| e.into_inner());
         self.tx_bytes.store(0, Ordering::Relaxed);
         self.rx_bytes.store(0, Ordering::Relaxed);
+        *rate = RateState::default();
     }
 
     /// Snapshot the counters with the caller-supplied live flow count.
@@ -108,10 +175,30 @@ impl StatsCounters {
     /// UdpForwarder::len()`, which is zero by construction once every flow has
     /// been torn down.
     pub fn snapshot(&self, active_flows: usize) -> Stats {
+        let mut rate = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+        self.snapshot_locked(active_flows, Instant::now(), &mut rate)
+    }
+
+    /// Snapshot the counters against an explicit instant.
+    ///
+    /// The rate is a function of the wall clock between reads; taking the time
+    /// as a parameter keeps that deterministic under test.
+    #[cfg(test)]
+    fn snapshot_at(&self, active_flows: usize, now: Instant) -> Stats {
+        let mut rate = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+        self.snapshot_locked(active_flows, now, &mut rate)
+    }
+
+    fn snapshot_locked(&self, active_flows: usize, now: Instant, rate: &mut RateState) -> Stats {
+        let tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
+        let rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
+        let (tx_bytes_per_sec, rx_bytes_per_sec) = rate.sample(tx_bytes, rx_bytes, now);
         Stats {
-            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
-            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
+            tx_bytes,
+            rx_bytes,
             active_flows,
+            tx_bytes_per_sec,
+            rx_bytes_per_sec,
         }
     }
 }
@@ -259,8 +346,109 @@ mod tests {
                 tx_bytes: 0,
                 rx_bytes: 0,
                 active_flows: 4,
+                tx_bytes_per_sec: 0,
+                rx_bytes_per_sec: 0,
             }
         );
+    }
+
+    #[test]
+    fn rate_is_zero_on_the_first_sample() {
+        let counters = StatsCounters::new();
+        counters.add_tx(4000);
+        assert_eq!(counters.snapshot_at(0, Instant::now()).tx_bytes_per_sec, 0);
+    }
+
+    #[test]
+    fn rate_settles_toward_a_steady_flow() {
+        let counters = StatsCounters::new();
+        let t0 = Instant::now();
+        counters.snapshot_at(0, t0); // prime the window
+        let mut last = 0;
+        for second in 1..=20u64 {
+            counters.add_tx(1000); // exactly 1000 B/s
+            last = counters
+                .snapshot_at(0, t0 + Duration::from_secs(second))
+                .tx_bytes_per_sec;
+        }
+        assert!(last <= 1000, "never overshoots the steady rate, got {last}");
+        assert!(last > 990, "settles just under 1000 B/s, got {last}");
+    }
+
+    #[test]
+    fn a_zero_interval_sample_keeps_the_pending_delta() {
+        let counters = StatsCounters::new();
+        let t0 = Instant::now();
+        counters.snapshot_at(0, t0);
+        counters.add_tx(2000);
+        assert_eq!(
+            counters.snapshot_at(0, t0).tx_bytes_per_sec,
+            0,
+            "dt == 0 is not a sample"
+        );
+        // The 2000 bytes are still measured over the full second.
+        assert_eq!(
+            counters
+                .snapshot_at(0, t0 + Duration::from_secs(1))
+                .tx_bytes_per_sec,
+            787
+        );
+    }
+
+    #[test]
+    fn reset_clears_the_rate() {
+        let counters = StatsCounters::new();
+        let t0 = Instant::now();
+        counters.snapshot_at(0, t0);
+        counters.add_tx(2000);
+        assert!(
+            counters
+                .snapshot_at(0, t0 + Duration::from_secs(1))
+                .tx_bytes_per_sec
+                > 0
+        );
+        counters.reset();
+        assert_eq!(
+            counters.snapshot_at(0, t0 + Duration::from_secs(2)),
+            Stats::default()
+        );
+    }
+
+    #[test]
+    fn reset_waits_for_the_rate_transaction_before_zeroing_counters() {
+        let counters = std::sync::Arc::new(StatsCounters::new());
+        counters.add_tx(4000);
+        let guard = counters.rate.lock().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::sync::Arc::clone(&counters);
+        let thread = std::thread::spawn(move || {
+            worker.reset();
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        let during_reset = counters.tx_bytes.load(Ordering::Relaxed);
+        drop(guard);
+        thread.join().unwrap();
+        assert_eq!(during_reset, 4000, "reset must not expose half-reset state");
+        assert_eq!(counters.snapshot(0), Stats::default());
+    }
+
+    #[test]
+    fn waiting_snapshot_reads_counters_after_acquiring_the_rate_lock() {
+        let counters = std::sync::Arc::new(StatsCounters::new());
+        counters.add_tx(4000);
+        let mut guard = counters.rate.lock().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::sync::Arc::clone(&counters);
+        let thread = std::thread::spawn(move || done_tx.send(worker.snapshot(0)).unwrap());
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        // Complete a reset while the reader waits for its transaction.
+        counters.tx_bytes.store(0, Ordering::Relaxed);
+        *guard = RateState::default();
+        drop(guard);
+        let snapshot = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        thread.join().unwrap();
+        assert_eq!(snapshot, Stats::default(), "reader must not retain pre-reset totals");
     }
 
     #[test]

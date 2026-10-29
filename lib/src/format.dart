@@ -21,3 +21,21 @@ String formatBytes(BigInt bytes) {
       : value.toStringAsFixed(1).replaceFirst(RegExp(r'\.0$'), '');
   return '$text ${units[unit]}';
 }
+
+/// Formats a byte-per-second rate as decimal megabits per second.
+///
+/// One Mbps is 10^6 bits, so a rate of 5,000,000 B/s reads `40`. Values of ten
+/// and above are whole numbers; below ten keep one decimal (dropping a trailing
+/// `.0`), matching [formatBytes].
+String formatMbps(BigInt bytesPerSec) {
+  final bits = bytesPerSec * BigInt.from(8);
+  final million = BigInt.from(1000000);
+  // Round exact decimal halves upward without binary floating-point ties.
+  if (bits >= million * BigInt.from(10)) {
+    return '${(bits + BigInt.from(500000)) ~/ million}';
+  }
+  final tenths = (bits * BigInt.from(10) + BigInt.from(500000)) ~/ million;
+  final whole = tenths ~/ BigInt.from(10);
+  final fraction = tenths % BigInt.from(10);
+  return fraction == BigInt.zero ? '$whole' : '$whole.$fraction';
+}

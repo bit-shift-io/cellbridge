@@ -9,6 +9,8 @@ import android.os.*
 import android.service.quicksettings.TileService
 import dev.cellbridge.cellbridge.R
 import org.json.JSONObject
+import java.math.BigDecimal
+import java.math.RoundingMode
 
 /**
  * The ongoing notification's title is the connection status itself, so the
@@ -16,6 +18,21 @@ import org.json.JSONObject
  */
 internal fun notificationTitle(status: String): String =
     if (status == "connected") "Connected" else "Disconnected"
+
+/** Rates are computed in Rust; this layer only formats decimal Mbps. */
+internal fun formatMbps(raw: String): String {
+    val bytes = raw.toBigDecimalOrNull()?.max(BigDecimal.ZERO) ?: BigDecimal.ZERO
+    val scale = if (bytes >= BigDecimal("1250000")) 0 else 1
+    return bytes.divide(BigDecimal("125000"), scale, RoundingMode.HALF_UP)
+        .stripTrailingZeros().toPlainString()
+}
+
+internal fun notificationSubtitle(snapshot: JSONObject?): String? {
+    if (snapshot?.optString("state") != "connected") return null
+    val down = formatMbps(snapshot.optString("rxBytesPerSec", "0"))
+    val up = formatMbps(snapshot.optString("txBytesPerSec", "0"))
+    return "$down-$up"
+}
 
 /** Native service owns networking. No Flutter engine is created here. */
 class BridgeService : Service() {
@@ -30,7 +47,7 @@ class BridgeService : Service() {
         super.onCreate()
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) manager.createNotificationChannel(NotificationChannel(CHANNEL, "CellBridge", NotificationManager.IMPORTANCE_LOW))
-        startForeground(NOTIFICATION, notification("Starting bridge"))
+        startForeground(NOTIFICATION, notification(null))
         thread = HandlerThread("CellBridge-service").also { it.start() }
         worker = Handler(thread.looper)
         synchronized(serviceStateLock) { instance = this }
@@ -105,7 +122,7 @@ class BridgeService : Service() {
                 lastWakeRenewal = now
             }
         } else if (!connected) releaseWakeLock()
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(snapshot.optString("state")))
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(snapshot))
         notifyTile()
     }
 
@@ -121,22 +138,22 @@ class BridgeService : Service() {
         synchronized(serviceStateLock) {
             if (instance === this) lastSnapshot = JSONObject(idleSnapshot()).put("state", "error").put("error", message).toString()
         }
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(JSONObject(lastSnapshot)))
         notifyTile()
         android.util.Log.e("CellBridge", message)
     }
 
     private fun releaseWakeLock() { wakeLock?.let { if (it.isHeld) it.release() }; wakeLock = null }
 
-    private fun notification(status: String): Notification {
+    private fun notification(snapshot: JSONObject?): Notification {
         val stop = PendingIntent.getService(this, 1, Intent(this, BridgeService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val open = PendingIntent.getActivity(this, 0, packageManager.getLaunchIntentForPackage(packageName), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         @Suppress("DEPRECATION")
         val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL) else Notification.Builder(this)
-        // The status is the title; there is no longer a "CellBridge" title or
-        // a content-text subtitle.
+        notificationSubtitle(snapshot)?.let { builder.setContentText(it) }
         return builder
             .setSmallIcon(R.drawable.ic_cellbridge_notification)
-            .setContentTitle(notificationTitle(status)).setOngoing(true)
+            .setContentTitle(notificationTitle(snapshot?.optString("state") ?: "idle")).setOngoing(true)
             .setContentIntent(open).addAction(Notification.Action.Builder(null, "Disconnect", stop).build()).build()
     }
 
